@@ -1,0 +1,16 @@
+{
+  "name": "liquidation-scanner",
+  "version": "1.0.0",
+  "description": "Bybit futures symbol scanner based on liquidity and open interest criteria",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node --watch app.js"
+  },
+  "keywords": ["bybit", "crypto", "futures", "scanner", "open-interest", "liquidation"],
+  "license": "MIT",
+  "dependencies": {
+    "winston": "^3.11.0",
+    "dotenv": "^16.3.1"
+  }
+}
