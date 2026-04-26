@@ -1,6 +1,6 @@
-const bybitClient = require('./bybitClient');
-const config = require('../config');
-const logger = require('../utils/logger');
+import bybitClient from './bybitClient.js';
+import config from '../config/index.js';
+import logger from '../utils/logger.js';
 
 class SymbolService {
   constructor() {
@@ -23,7 +23,7 @@ class SymbolService {
           symbol: ticker.symbol,
           volume24h: parseFloat(ticker.turnover24h) || 0,
           openInterestValue: parseFloat(ticker.openInterestValue) || 0,
-          lastPrice: parseFloat(ticker.lastPrice) || 0
+          lastPrice: parseFloat(ticker.lastPrice) || 0,
         }))
         .filter((ticker) => {
           const passesVolume = ticker.volume24h > config.FILTER_VOLUME_THRESHOLD;
@@ -34,12 +34,13 @@ class SymbolService {
       this._filteredSymbols = filtered;
       this._lastUpdated = new Date();
 
-      logger.info(`Symbol filtering complete: ${filtered.length} symbols passed filters (from ${tickers.length} total)`);
+      logger.info(
+        `Symbol filtering complete: ${filtered.length} symbols passed filters (from ${tickers.length} total)`
+      );
 
       return filtered;
     } catch (error) {
       logger.error(`Error in fetchAndFilterSymbols: ${error.message}`, { stack: error.stack });
-      // Return cached data if available, otherwise empty array
       return this.getFilteredSymbols();
     }
   }
@@ -53,6 +54,14 @@ class SymbolService {
   }
 
   /**
+   * Get just the symbol names as an array of strings
+   * @returns {string[]}
+   */
+  getSymbolNames() {
+    return this._filteredSymbols.map((s) => s.symbol);
+  }
+
+  /**
    * Get the last update timestamp
    * @returns {Date|null}
    */
@@ -61,4 +70,5 @@ class SymbolService {
   }
 }
 
-module.exports = new SymbolService();
+const symbolService = new SymbolService();
+export default symbolService;

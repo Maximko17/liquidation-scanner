@@ -1,6 +1,6 @@
-const https = require('https');
-const logger = require('../utils/logger');
-const config = require('../config');
+import https from 'node:https';
+import logger from '../utils/logger.js';
+import config from '../config/index.js';
 
 class BybitClient {
   constructor() {
@@ -75,4 +75,5 @@ class BybitClient {
   }
 }
 
-module.exports = new BybitClient();
+const bybitClient = new BybitClient();
+export default bybitClient;
