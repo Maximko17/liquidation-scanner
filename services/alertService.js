@@ -2,6 +2,7 @@ import https from 'node:https';
 import config from '../config/index.js';
 import { formatUSD } from '../utils/formatters.js';
 import logger from '../utils/logger.js';
+import reactionTracker from './signalReactionTracker.js';
 import TelegramBot from 'node-telegram-bot-api';
 
 /**
@@ -77,6 +78,42 @@ class AlertService {
     // ── If nothing is configured, log the alert ──────────
     if (!config.TELEGRAM_BOT_TOKEN && !config.PUSHOVER_USER_KEY) {
       logger.warn('No alert channels configured! Alert would have been:');
+      console.log(message);
+    }
+  }
+
+  /**
+   * Send a post-signal reaction analysis as a SECOND alert.
+   * Called ~60s after the initial liquidation spike alert.
+   * No throttling — each reaction is unique (one per signal).
+   * @param {import('./signalReactionTracker.js').ReactionResult} reaction
+   */
+  async sendReaction(reaction) {
+    const message = reactionTracker.formatReaction(reaction);
+
+    logger.info(`Dispatching reaction: ${reaction.symbol}:${reaction.side} — ${reaction.classification}`);
+
+    // ── Send to Telegram ─────────────────────────────────
+    if (config.TELEGRAM_BOT_TOKEN && config.TELEGRAM_CHAT_ID) {
+      this._sendTelegram(message).catch((err) => {
+        logger.error('Telegram reaction send failed', { error: err.message });
+      });
+    } else {
+      logger.debug('Telegram not configured — skipping reaction');
+    }
+
+    // ── Send to Pushover with reaction-specific title ─────
+    if (config.PUSHOVER_USER_KEY && config.PUSHOVER_APP_TOKEN) {
+      this._sendPushoverReaction(message).catch((err) => {
+        logger.error('Pushover reaction send failed', { error: err.message });
+      });
+    } else {
+      logger.debug('Pushover not configured — skipping reaction');
+    }
+
+    // ── Fallback ─────────────────────────────────────────
+    if (!config.TELEGRAM_BOT_TOKEN && !config.PUSHOVER_USER_KEY) {
+      logger.warn('No alert channels configured! Reaction would have been:');
       console.log(message);
     }
   }
@@ -195,19 +232,40 @@ class AlertService {
   }
 
   /**
-   * Send a notification via Pushover API.
+   * Send a notification via Pushover API (standard alert).
    * @param {string} message
    * @returns {Promise<void>}
    */
   _sendPushover(message) {
+    return this._sendPushoverWithTitle(message, '🚨 Liquidation Spike Alert', 'siren', '1');
+  }
+
+  /**
+   * Send a reaction analysis via Pushover API (lower priority, different sound).
+   * @param {string} message
+   * @returns {Promise<void>}
+   */
+  _sendPushoverReaction(message) {
+    return this._sendPushoverWithTitle(message, '📊 Liquidation Reaction', 'magic', '0');
+  }
+
+  /**
+   * Send a notification via Pushover API with configurable title/sound/priority.
+   * @param {string} message
+   * @param {string} title
+   * @param {string} sound
+   * @param {string} priority
+   * @returns {Promise<void>}
+   */
+  _sendPushoverWithTitle(message, title, sound, priority) {
     return new Promise((resolve, reject) => {
       const params = new URLSearchParams({
         token: config.PUSHOVER_APP_TOKEN,
         user: config.PUSHOVER_USER_KEY,
         message,
-        title: '🚨 Liquidation Spike Alert',
-        priority: '1', // High priority
-        sound: 'siren',
+        title,
+        priority,
+        sound,
       });
 
       const options = {

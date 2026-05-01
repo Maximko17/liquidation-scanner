@@ -74,4 +74,15 @@ export default {
   // ── Thresholds ────────────────────────────────────
   THRESHOLD_CONFIG: thresholdConfig,
   getThresholdConfig,
+
+  // ── Reaction Classification ────────────────────
+  // Price delta thresholds for post-signal analysis (in %)
+  REACTION_DP5_STRONG: parseFloat(process.env.REACTION_DP5_STRONG) || 0.25,
+  REACTION_DP15_CONTINUATION: parseFloat(process.env.REACTION_DP15_CONTINUATION) || 0.15,
+  REACTION_DP15_REVERSAL: parseFloat(process.env.REACTION_DP15_REVERSAL) || -0.15,
+  REACTION_DP60_CONTINUATION: parseFloat(process.env.REACTION_DP60_CONTINUATION) || 0.3,
+  REACTION_DP60_REVERSAL: parseFloat(process.env.REACTION_DP60_REVERSAL) || -0.2,
+  REACTION_ABSORPTION_MAX: parseFloat(process.env.REACTION_ABSORPTION_MAX) || 0.1,
+  REACTION_MERGE_WINDOW_MS: parseInt(process.env.REACTION_MERGE_WINDOW_MS, 10) || 10_000,
+  REACTION_MAX_ACTIVE_SIGNALS: parseInt(process.env.REACTION_MAX_ACTIVE_SIGNALS, 10) || 3,
 };

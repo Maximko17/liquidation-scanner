@@ -40,6 +40,31 @@ class BybitClient {
   }
 
   /**
+   * Fetch a single linear ticker from Bybit by symbol.
+   * Used by signalReactionTracker to capture price & OI snapshots.
+   * @param {string} symbol - e.g. "BTCUSDT"
+   * @returns {Promise<{ price: number, openInterest: number }>}
+   */
+  async getTicker(symbol) {
+    logger.debug(`Fetching ticker for ${symbol}`);
+    const response = await this._request('/v5/market/tickers', { category: 'linear', symbol });
+
+    if (response.retCode !== 0) {
+      throw new Error(`Bybit API error for ${symbol}: ${response.retMsg || 'Unknown error'}`);
+    }
+
+    const ticker = response.result?.list?.[0];
+    if (!ticker) {
+      throw new Error(`No ticker data returned for ${symbol}`);
+    }
+
+    return {
+      price: parseFloat(ticker.lastPrice) || 0,
+      openInterest: parseFloat(ticker.openInterestValue) || 0,
+    };
+  }
+
+  /**
    * Fetch all linear (USDT perpetual) tickers from Bybit
    * Handles pagination if there are more results
    * @returns {Promise<Array>} - Array of ticker objects

@@ -4,6 +4,7 @@ import symbolService from './services/symbolService.js';
 import wsClient from './services/websocketClient.js';
 import tracker from './services/liquidationTracker.js';
 import alertService from './services/alertService.js';
+import reactionTracker from './services/signalReactionTracker.js';
 
 /**
  * Bybit Liquidation Monitoring System
@@ -24,9 +25,15 @@ wsClient.onMessage((event) => {
   tracker.handleEvent(event);
 });
 
-// Tracker alerts → alertService
+// Tracker alerts → alertService + reactionTracker
 tracker.onAlert((alert) => {
   alertService.sendAlert(alert);
+  reactionTracker.startTracking(alert);
+});
+
+// Reaction results → alertService (secondary message after 60s)
+reactionTracker.onReaction((reaction) => {
+  alertService.sendReaction(reaction);
 });
 
 // ── Startup ─────────────────────────────────────────────────────
@@ -91,6 +98,7 @@ async function shutdown(signal) {
   logger.info(`Received ${signal}. Shutting down gracefully...`);
 
   tracker.stop();
+  reactionTracker.stop();
   await wsClient.shutdown();
 
   logger.info('Shutdown complete');
