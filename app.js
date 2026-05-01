@@ -65,8 +65,23 @@ async function start() {
   // 4. Start the liquidation tracker tick
   tracker.start();
 
+  // 5. Schedule periodic symbol refresh to pick up new listings
+  setInterval(async () => {
+    try {
+      logger.debug('Running scheduled symbol refresh...');
+      const { added } = await symbolService.refreshSymbols();
+      if (added.length > 0) {
+        logger.info(`New symbols detected, subscribing: ${added.join(', ')}`);
+        wsClient.subscribeMany(added);
+      }
+    } catch (error) {
+      logger.error('Scheduled symbol refresh failed', { error: error.message });
+    }
+  }, config.FETCH_INTERVAL_MS);
+
   logger.info('✅ Liquidation Scanner is live');
   logger.info(`   Window: ${config.WINDOW_SIZE_MS}ms | Tick: ${config.WINDOW_TICK_MS}ms | History: ${config.HISTORY_DURATION_MS}ms`);
+  logger.info(`   Symbol refresh: every ${config.FETCH_INTERVAL_MS / 60000}min`);
   logger.info(`   Alert channels: ${[config.TELEGRAM_BOT_TOKEN && 'Telegram', config.PUSHOVER_USER_KEY && 'Pushover'].filter(Boolean).join(', ') || 'NONE CONFIGURED'}`);
 }
 

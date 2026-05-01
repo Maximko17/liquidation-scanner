@@ -115,12 +115,12 @@ class LiquidationTracker {
     const events = data.buffer[side];
     const history = data.history[side];
 
-    // 1. Sliding window: sum sizes where now - time <= WINDOW_SIZE_MS
+    // 1. Sliding window: sum sizes where event time falls within WINDOW_SIZE_MS
     const windowCutoff = now - config.WINDOW_SIZE_MS;
     let L_now = 0;
 
     for (const evt of events) {
-      if (now - evt.time <= config.WINDOW_SIZE_MS) {
+      if (evt.time >= windowCutoff) {
         L_now += evt.size;
       }
     }

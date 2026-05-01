@@ -68,6 +68,44 @@ class SymbolService {
   getLastUpdated() {
     return this._lastUpdated;
   }
+
+  /**
+   * Refresh the symbol list from REST, detect added symbols.
+   * Called periodically (FETCH_INTERVAL_MS) to pick up new listings
+   * and symbols whose volume/OI crossed the filter threshold.
+   * @returns {Promise<{ added: string[], removed: string[] }>}
+   */
+  async refreshSymbols() {
+    const previousNames = new Set(this.getSymbolNames());
+
+    await this.fetchAndFilterSymbols();
+
+    const currentNames = new Set(this.getSymbolNames());
+
+    const added = [];
+    for (const name of currentNames) {
+      if (!previousNames.has(name)) {
+        added.push(name);
+      }
+    }
+
+    const removed = [];
+    for (const name of previousNames) {
+      if (!currentNames.has(name)) {
+        removed.push(name);
+      }
+    }
+
+    if (added.length > 0 || removed.length > 0) {
+      logger.info(
+        `Symbol refresh: ${added.length} added, ${removed.length} removed. Total: ${currentNames.size}`
+      );
+    } else {
+      logger.debug(`Symbol refresh: no changes. Total: ${currentNames.size}`);
+    }
+
+    return { added, removed };
+  }
 }
 
 const symbolService = new SymbolService();

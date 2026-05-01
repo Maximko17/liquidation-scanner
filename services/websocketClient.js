@@ -22,6 +22,8 @@ class WebsocketClient {
     this.messageHandlers = [];
     this.currentBatchRequest = null; // Set of symbols awaiting subscribe response
     this.pingInterval = null; // Ping/pong keepalive interval
+    this._pendingResubscribe = null; // Symbols to re-subscribe after reconnect
+    this._serverTimeOffset = 0; // Clock drift correction (ms)
   }
 
   /**
@@ -43,9 +45,10 @@ class WebsocketClient {
         // Start ping/pong keepalive
         this._startPing();
 
-        // Re-subscribe to all previously-subscribed symbols after reconnect
-        if (this.subscribedSymbols.size > 0) {
-          const symbols = Array.from(this.subscribedSymbols);
+        // Re-subscribe to previously-tracked symbols after reconnect
+        if (this._pendingResubscribe && this._pendingResubscribe.length > 0) {
+          const symbols = this._pendingResubscribe;
+          this._pendingResubscribe = null;
           logger.info(`Re-subscribing to ${symbols.length} symbols after reconnect`);
           this._sendSubscribe(symbols);
         }
@@ -75,6 +78,12 @@ class WebsocketClient {
       this.ws.on('close', (code, reason) => {
         this.isConnected = false;
         this._stopPing();
+
+        // Save symbols for reconnection BEFORE clearing the set
+        // (otherwise _sendSubscribe will skip them all because subscribedSymbols.has(s) === true)
+        this._pendingResubscribe = Array.from(this.subscribedSymbols);
+        this.subscribedSymbols.clear();
+
         logger.warn('WebSocket closed', { code, reason: reason?.toString() });
         this._handleReconnect();
       });
@@ -156,14 +165,29 @@ class WebsocketClient {
     const sideRaw = raw.S; // "Buy" or "Sell"
     const eventTime = parseInt(raw.T, 10) || Date.now();
 
+    // Clock drift correction: align server timestamp with local time
+    // Computed once on first event, then reused
+    if (this._serverTimeOffset === 0) {
+      this._serverTimeOffset = Date.now() - eventTime;
+      if (Math.abs(this._serverTimeOffset) > 5000) {
+        logger.warn(`Clock drift detected: ${this._serverTimeOffset}ms offset from Bybit server`, {
+          localTime: new Date().toISOString(),
+          serverTime: new Date(eventTime).toISOString(),
+        });
+      }
+    }
+
     // Task spec mapping
     const side = sideRaw === 'Buy' ? 'long' : 'short';
+
+    // Normalize timestamp to local clock to avoid sliding-window miscalculations
+    const normalizedTime = eventTime + this._serverTimeOffset;
 
     const event = {
       symbol,
       side,
       size,
-      time: eventTime,
+      time: normalizedTime,
     };
 
     logger.debug(
