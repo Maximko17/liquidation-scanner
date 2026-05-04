@@ -353,6 +353,48 @@ class PriceStreamService {
   // ═══════════════════════════════════════════════════════════
 
   /**
+   * Compute high/low range for a symbol over a given time window.
+   * Single for-loop — no filter/map chains, no allocations beyond primitives.
+   *
+   * @param {string} symbol
+   * @param {number} durationMs - Window duration in ms (e.g. 300_000 for 5min)
+   * @param {number} now - Current timestamp (Date.now())
+   * @returns {{ high: number, low: number, coverage: number } | null}
+   *   coverage = actual time span / durationMs (0..1). < 0.5 means low reliability.
+   */
+  getRange(symbol, durationMs, now) {
+    const buffer = this.priceBuffer.get(symbol);
+    if (!buffer || buffer.length === 0) return null;
+
+    const cutoff = now - durationMs;
+
+    let high = -Infinity;
+    let low = Infinity;
+    let oldestInWindow = Infinity;
+    let newestInWindow = -Infinity;
+    let count = 0;
+
+    // Plain for-loop — no .filter(), no .map()
+    for (let i = 0, len = buffer.length; i < len; i++) {
+      const entry = buffer[i];
+      if (entry.time < cutoff) continue;
+
+      if (entry.price > high) high = entry.price;
+      if (entry.price < low) low = entry.price;
+      if (entry.time < oldestInWindow) oldestInWindow = entry.time;
+      if (entry.time > newestInWindow) newestInWindow = entry.time;
+      count++;
+    }
+
+    if (count === 0 || !isFinite(high) || !isFinite(low)) return null;
+
+    const actualSpan = newestInWindow - oldestInWindow;
+    const coverage = durationMs > 0 ? Math.min(actualSpan / durationMs, 1) : 1;
+
+    return { high, low, coverage };
+  }
+
+  /**
    * Find the price+OI entry closest to a target timestamp.
    * Plain for-loop with early exit — no .find(), no .map(), no allocations.
    *

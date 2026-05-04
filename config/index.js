@@ -57,8 +57,13 @@ export default {
 
   // ── Price Stream (WS-based price buffer) ──────────
   PRICE_WS_URL: process.env.PRICE_WS_URL || 'wss://stream.bybit.com/v5/public/linear',
-  PRICE_BUFFER_MAX_AGE_MS: parseInt(process.env.PRICE_BUFFER_MAX_AGE_MS, 10) || 120_000,
+  PRICE_BUFFER_MAX_AGE_MS: parseInt(process.env.PRICE_BUFFER_MAX_AGE_MS, 10) || 1_800_000,
   PRICE_THROTTLE_MS: parseInt(process.env.PRICE_THROTTLE_MS, 10) || 1_000,
+
+  // ── Market Context (price ranges) ───────────────
+  CONTEXT_SHORT_RANGE_MS: parseInt(process.env.CONTEXT_SHORT_RANGE_MS, 10) || 300_000,
+  CONTEXT_MID_RANGE_MS: parseInt(process.env.CONTEXT_MID_RANGE_MS, 10) || 1_800_000,
+  CONTEXT_MIN_COVERAGE: parseFloat(process.env.CONTEXT_MIN_COVERAGE) || 0.5,
 
   // ── Windows & Timing ──────────────────────────────────
   BUFFER_DURATION_MS: parseInt(process.env.BUFFER_DURATION_MS, 10) || 20_000,

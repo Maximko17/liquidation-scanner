@@ -190,6 +190,30 @@ class SignalReactionTracker {
       oiLabel = '⚪ OI: unchanged';
     }
 
+    // ── Market context (price ranges from ticker buffer) ──
+    const now = Date.now();
+    const range5m = priceStreamService.getRange(state.symbol, config.CONTEXT_SHORT_RANGE_MS, now);
+    const range30m = priceStreamService.getRange(state.symbol, config.CONTEXT_MID_RANGE_MS, now);
+
+    let position_5m = null;
+    let position_30m = null;
+    let lowData5m = false;
+    let lowData30m = false;
+    let contextLabel = '';
+
+    if (range5m && range5m.high !== range5m.low) {
+      position_5m = (p60 - range5m.low) / (range5m.high - range5m.low);
+      lowData5m = range5m.coverage < config.CONTEXT_MIN_COVERAGE;
+    }
+    if (range30m && range30m.high !== range30m.low) {
+      position_30m = (p60 - range30m.low) / (range30m.high - range30m.low);
+      lowData30m = range30m.coverage < config.CONTEXT_MIN_COVERAGE;
+    }
+
+    if (position_5m !== null && position_30m !== null) {
+      contextLabel = this._buildContextLabel(position_5m, position_30m, lowData5m, lowData30m);
+    }
+
     /** @type {ReactionResult} */
     const reaction = {
       symbol: state.symbol,
@@ -204,6 +228,11 @@ class SignalReactionTracker {
       classification,
       merged: state.merged,
       mergeCount: state.mergeCount,
+      position_5m,
+      position_30m,
+      lowData5m,
+      lowData30m,
+      contextLabel,
     };
 
     logger.info(
@@ -255,6 +284,62 @@ class SignalReactionTracker {
   }
 
   /**
+   * Build multi-timeframe context interpretation label.
+   *
+   * CASE 1 — Alignment: both TFs near same extreme → "Strong resistance/support"
+   * CASE 2 — Local only: 5m extreme, 30m mid-range → "Local high/low, no HTF"
+   * CASE 3 — Conflict: one near high, other near low → "Range expansion / conflicting"
+   *
+   * @param {number} pos5  - Position in 5m range (0..1)
+   * @param {number} pos30 - Position in 30m range (0..1)
+   * @param {boolean} lowData5  - 5m coverage < threshold
+   * @param {boolean} lowData30 - 30m coverage < threshold
+   * @returns {string}
+   */
+  _buildContextLabel(pos5, pos30, lowData5, lowData30) {
+    const nearHigh5 = pos5 > 0.8;
+    const nearLow5 = pos5 < 0.2;
+    const nearHigh30 = pos30 > 0.8;
+    const nearLow30 = pos30 < 0.2;
+
+    let label = '';
+
+    // CASE 1: Alignment — strong multi-TF context
+    if (nearHigh5 && nearHigh30) {
+      label = '→ Strong resistance (multi-timeframe)';
+    } else if (nearLow5 && nearLow30) {
+      label = '→ Strong support (multi-timeframe)';
+
+    // CASE 2: Local extreme only (5m extreme, 30m mid-range)
+    } else if (nearHigh5 && pos30 >= 0.3 && pos30 <= 0.7) {
+      label = '→ Local high (5m), no HTF resistance';
+    } else if (nearLow5 && pos30 >= 0.3 && pos30 <= 0.7) {
+      label = '→ Local low (5m), no HTF support';
+
+    // CASE 3: Conflict — divergent extremes
+    } else if ((nearHigh5 && nearLow30) || (nearLow5 && nearHigh30)) {
+      label = '→ Range expansion / conflicting signals';
+
+    // Partial: single-TF near extreme
+    } else if (nearHigh5) {
+      label = '→ Near resistance (5m)';
+    } else if (nearLow5) {
+      label = '→ Near support (5m)';
+    } else if (nearHigh30) {
+      label = '→ Near resistance (30m)';
+    } else if (nearLow30) {
+      label = '→ Near support (30m)';
+    }
+
+    // Low data warning
+    if (lowData5 || lowData30) {
+      label += ' | ⚠ low context reliability';
+    }
+
+    return label;
+  }
+
+  /**
    * Build human-readable type label for a reaction.
    * LONG liquidation → "LONG SQUEEZE" (shorts got liquidated → price rises)
    * SHORT liquidation → "SHORT LIQUIDATION CASCADE" (longs got liquidated → price drops)
@@ -274,6 +359,19 @@ class SignalReactionTracker {
     const typeLabel = this._typeLabel(reaction.side);
     const mergeNote = reaction.merged ? ` (merged x${reaction.mergeCount})` : '';
 
+    // Market context lines
+    const contextLines = [];
+    if (reaction.position_5m !== null) {
+      contextLines.push('');
+      contextLines.push(`Position 5m: ${reaction.position_5m.toFixed(2)}`);
+    }
+    if (reaction.position_30m !== null) {
+      contextLines.push(`Position 30m: ${reaction.position_30m.toFixed(2)}`);
+    }
+    if (reaction.contextLabel) {
+      contextLines.push(reaction.contextLabel);
+    }
+
     return [
       `📊 ${reaction.symbol} ${typeLabel} (${reaction.ratio.toFixed(1)}x)${mergeNote}`,
       ``,
@@ -281,6 +379,7 @@ class SignalReactionTracker {
       `Δ15s: ${this._fmtPct(reaction.dp15)}`,
       `Δ60s: ${this._fmtPct(reaction.dp60)}`,
       `ΔOI:  ${this._fmtPct(reaction.dOI)}`,
+      ...contextLines,
       ``,
       `→ ${reaction.classification}`,
       `${reaction.oiLabel}`,
