@@ -1,4 +1,5 @@
 import priceStreamService from './priceStreamService.js';
+import { scoreReaction } from './signalScorer.js';
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
 
@@ -219,6 +220,7 @@ class SignalReactionTracker {
       symbol: state.symbol,
       side: state.side,
       ratio: state.ratio,
+      L_now: state.L_now,
       startTime: state.startTime,
       dp5,
       dp15,
@@ -234,6 +236,11 @@ class SignalReactionTracker {
       lowData30m,
       contextLabel,
     };
+
+    // ── Confidence score ──────────────────────────────────
+    const { score: confidenceScore, label: confidenceLabel } = scoreReaction(reaction);
+    reaction.confidenceScore = confidenceScore;
+    reaction.confidenceLabel = confidenceLabel;
 
     logger.info(
       `Reaction ${state.id}: ${classification} | ΔP5=${dp5.toFixed(2)}% ΔP15=${dp15.toFixed(2)}% ΔP60=${dp60.toFixed(2)}% ΔOI=${dOI.toFixed(2)}%`
@@ -372,6 +379,11 @@ class SignalReactionTracker {
       contextLines.push(reaction.contextLabel);
     }
 
+    // Confidence line
+    const confidenceLine = reaction.confidenceScore !== undefined
+      ? `\nConfidence: ${reaction.confidenceScore}/10 (${reaction.confidenceLabel})`
+      : '';
+
     return [
       `📊 ${reaction.symbol} ${typeLabel} (${reaction.ratio.toFixed(1)}x)${mergeNote}`,
       ``,
@@ -382,7 +394,7 @@ class SignalReactionTracker {
       ...contextLines,
       ``,
       `→ ${reaction.classification}`,
-      `${reaction.oiLabel}`,
+      `${reaction.oiLabel}${confidenceLine}`,
     ].join('\n');
   }
 
@@ -511,6 +523,7 @@ class SignalReactionTracker {
  * @property {string} symbol
  * @property {'long'|'short'} side
  * @property {number} ratio
+ * @property {number} L_now
  * @property {number} startTime
  * @property {number} dp5
  * @property {number} dp15
