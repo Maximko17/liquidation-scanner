@@ -1,4 +1,4 @@
-import bybitClient from './bybitClient.js';
+import priceStreamService from './priceStreamService.js';
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
 
@@ -104,21 +104,22 @@ class SignalReactionTracker {
    * @param {SignalState} state
    */
   async _initTracking(state) {
-    try {
-      const ticker = await bybitClient.getTicker(state.symbol);
-      state.price_0 = ticker.price;
-      state.oi_0 = ticker.openInterest;
-      logger.debug(`Reaction ${state.id}: price_0=${state.price_0}, oi_0=${state.oi_0}`);
-
-      // Schedule captures
-      state.timers.t5 = setTimeout(() => this._capture5s(state), 5_000);
-      state.timers.t15 = setTimeout(() => this._capture15s(state), 15_000);
-      state.timers.t60 = setTimeout(() => this._capture60s(state), 60_000);
-      state.timers.cleanup = setTimeout(() => this._cleanup(state), 90_000);
-    } catch (error) {
-      logger.error(`Reaction ${state.id}: failed to fetch price_0 — aborting tracking`, { error: error.message });
+    const snap = priceStreamService.getClosestSnapshot(state.symbol, Date.now());
+    if (!snap) {
+      logger.error(`Reaction ${state.id}: no price data in buffer — aborting tracking`);
       this._removeSignal(state);
+      return;
     }
+
+    state.price_0 = snap.price;
+    state.oi_0 = snap.openInterest;
+    logger.debug(`Reaction ${state.id}: price_0=${state.price_0}, oi_0=${state.oi_0}`);
+
+    // Schedule captures
+    state.timers.t5 = setTimeout(() => this._capture5s(state), 5_000);
+    state.timers.t15 = setTimeout(() => this._capture15s(state), 15_000);
+    state.timers.t60 = setTimeout(() => this._capture60s(state), 60_000);
+    state.timers.cleanup = setTimeout(() => this._cleanup(state), 90_000);
   }
 
   /**
@@ -126,14 +127,10 @@ class SignalReactionTracker {
    * @param {SignalState} state
    */
   async _capture5s(state) {
-    try {
-      const ticker = await bybitClient.getTicker(state.symbol);
-      state.price_5s = ticker.price;
-      logger.debug(`Reaction ${state.id}: price_5s=${state.price_5s}`);
-    } catch (error) {
-      logger.warn(`Reaction ${state.id}: failed to capture price_5s`, { error: error.message });
-      state.price_5s = state.price_0; // Fallback to initial price
-    }
+    const targetTime = state.startTime + 5_000;
+    const snap = priceStreamService.getClosestSnapshot(state.symbol, targetTime);
+    state.price_5s = snap?.price ?? state.price_0;
+    logger.debug(`Reaction ${state.id}: price_5s=${state.price_5s}`);
   }
 
   /**
@@ -141,14 +138,10 @@ class SignalReactionTracker {
    * @param {SignalState} state
    */
   async _capture15s(state) {
-    try {
-      const ticker = await bybitClient.getTicker(state.symbol);
-      state.price_15s = ticker.price;
-      logger.debug(`Reaction ${state.id}: price_15s=${state.price_15s}`);
-    } catch (error) {
-      logger.warn(`Reaction ${state.id}: failed to capture price_15s`, { error: error.message });
-      state.price_15s = state.price_5s ?? state.price_0;
-    }
+    const targetTime = state.startTime + 15_000;
+    const snap = priceStreamService.getClosestSnapshot(state.symbol, targetTime);
+    state.price_15s = snap?.price ?? state.price_5s ?? state.price_0;
+    logger.debug(`Reaction ${state.id}: price_15s=${state.price_15s}`);
   }
 
   /**
@@ -156,16 +149,11 @@ class SignalReactionTracker {
    * @param {SignalState} state
    */
   async _capture60s(state) {
-    try {
-      const ticker = await bybitClient.getTicker(state.symbol);
-      state.price_60s = ticker.price;
-      state.oi_60s = ticker.openInterest;
-      logger.debug(`Reaction ${state.id}: price_60s=${state.price_60s}, oi_60s=${state.oi_60s}`);
-    } catch (error) {
-      logger.warn(`Reaction ${state.id}: failed to capture price_60s`, { error: error.message });
-      state.price_60s = state.price_15s ?? state.price_0;
-      state.oi_60s = state.oi_0;
-    }
+    const targetTime = state.startTime + 60_000;
+    const snap = priceStreamService.getClosestSnapshot(state.symbol, targetTime);
+    state.price_60s = snap?.price ?? state.price_15s ?? state.price_0;
+    state.oi_60s = snap?.openInterest ?? state.oi_0;
+    logger.debug(`Reaction ${state.id}: price_60s=${state.price_60s}, oi_60s=${state.oi_60s}`);
 
     // Classify and emit
     this._finalize(state);

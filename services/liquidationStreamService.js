@@ -3,12 +3,15 @@ import config from '../config/index.js';
 import logger from '../utils/logger.js';
 
 /**
- * Bybit WebSocket client for liquidation streams (v5 public)
- * Handles connection, reconnection, batch subscriptions, and event parsing.
+ * Liquidation Stream Service
+ *
+ * Bybit WebSocket client (v5 public) subscribed to allLiquidation.{symbol} topics.
+ * Handles connection, reconnection, batch subscriptions, event normalization,
+ * and clock-drift correction.
  *
  * Single-connection design — never opens multiple sockets.
  */
-class WebsocketClient {
+class LiquidationStreamService {
   constructor() {
     this.ws = null;
     this.url = config.BYBIT_WS_URL;
@@ -33,13 +36,13 @@ class WebsocketClient {
    */
   connect() {
     return new Promise((resolve, reject) => {
-      logger.info(`Connecting to Bybit WebSocket: ${this.url}`);
+      logger.info(`[liquidationStream] Connecting to ${this.url}`);
 
       this.ws = new WebSocket(this.url);
 
       this.ws.on('open', () => {
         this.isConnected = true;
-        logger.info('WebSocket connected');
+        logger.info('[liquidationStream] WebSocket connected');
         this.reconnectAttempts = 0;
 
         // Start ping/pong keepalive
@@ -49,7 +52,7 @@ class WebsocketClient {
         if (this._pendingResubscribe && this._pendingResubscribe.length > 0) {
           const symbols = this._pendingResubscribe;
           this._pendingResubscribe = null;
-          logger.info(`Re-subscribing to ${symbols.length} symbols after reconnect`);
+          logger.info(`[liquidationStream] Re-subscribing to ${symbols.length} symbol(s) after reconnect`);
           this._sendSubscribe(symbols);
         }
         resolve();
@@ -60,18 +63,18 @@ class WebsocketClient {
           const message = JSON.parse(data.toString());
           this._handleMessage(message);
         } catch (error) {
-          logger.error('Failed to parse WebSocket message', { error });
+          logger.error('[liquidationStream] Failed to parse message', { error });
         }
       });
 
       // Log pong responses from server
-      this.ws.on('pong', (data) => {
-        logger.debug('WebSocket pong received');
+      this.ws.on('pong', () => {
+        logger.debug('[liquidationStream] pong');
       });
 
       this.ws.on('error', (error) => {
         this.isConnected = false;
-        logger.error('WebSocket error', { error: error.message });
+        logger.error('[liquidationStream] WebSocket error', { error: error.message });
         reject(error);
       });
 
@@ -84,7 +87,7 @@ class WebsocketClient {
         this._pendingResubscribe = Array.from(this.subscribedSymbols);
         this.subscribedSymbols.clear();
 
-        logger.warn('WebSocket closed', { code, reason: reason?.toString() });
+        logger.warn('[liquidationStream] WebSocket closed', { code, reason: reason?.toString() });
         this._handleReconnect();
       });
     });
@@ -99,12 +102,12 @@ class WebsocketClient {
     this._stopPing(); // Clear any existing interval
 
     const interval = config.WS_PING_INTERVAL_MS || 20_000;
-    logger.info(`Starting WebSocket keepalive ping every ${interval}ms`);
+    logger.info(`[liquidationStream] Starting keepalive ping every ${interval}ms`);
 
     this.pingInterval = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.ping();
-        logger.debug('WebSocket ping sent');
+        logger.debug('[liquidationStream] ping');
       }
     }, interval);
   }
@@ -137,11 +140,11 @@ class WebsocketClient {
       const events = message.data; // Array of liquidation events
 
       if (!Array.isArray(events)) {
-        logger.warn('Expected array in liquidation data', { data: message.data });
+        logger.warn('[liquidationStream] Expected array in liquidation data', { data: message.data });
         return;
       }
 
-      logger.debug(`Received ${events.length} liquidation event(s) for ${symbol}`);
+      logger.debug(`[liquidationStream] Received ${events.length} liquidation event(s) for ${symbol}`);
 
       for (const raw of events) {
         this._handleLiquidationEvent(symbol, raw);
@@ -170,7 +173,7 @@ class WebsocketClient {
     if (this._serverTimeOffset === 0) {
       this._serverTimeOffset = Date.now() - eventTime;
       if (Math.abs(this._serverTimeOffset) > 5000) {
-        logger.warn(`Clock drift detected: ${this._serverTimeOffset}ms offset from Bybit server`, {
+        logger.warn(`[liquidationStream] Clock drift detected: ${this._serverTimeOffset}ms offset from Bybit server`, {
           localTime: new Date().toISOString(),
           serverTime: new Date(eventTime).toISOString(),
         });
@@ -191,7 +194,7 @@ class WebsocketClient {
     };
 
     logger.debug(
-      `Liquidation: ${symbol} ${side.toUpperCase()} size=${size} time=${new Date(eventTime).toISOString()}`
+      `[liquidationStream] ${symbol} ${side.toUpperCase()} size=${size}`
     );
 
     // Notify all registered handlers
@@ -199,7 +202,7 @@ class WebsocketClient {
       try {
         handler(event);
       } catch (error) {
-        logger.error('Error in message handler', { error });
+        logger.error('[liquidationStream] Error in message handler', { error });
       }
     }
   }
@@ -212,7 +215,7 @@ class WebsocketClient {
    */
   _handleSubscribeResponse(message) {
     if (!this.currentBatchRequest) {
-      logger.debug('Received subscribe response but no pending batch request');
+      logger.debug('[liquidationStream] Received subscribe response but no pending batch request');
       return;
     }
 
@@ -222,9 +225,9 @@ class WebsocketClient {
     if (message.success) {
       for (const symbol of symbols) {
         this.subscribedSymbols.add(symbol);
-        logger.debug(`Subscribed to ${symbol}`);
+        logger.debug(`[liquidationStream] Subscribed to ${symbol}`);
       }
-      logger.info(`Batch subscription OK for ${symbols.length} symbols`);
+      logger.info(`[liquidationStream] Batch subscription OK for ${symbols.length} symbol(s)`);
     } else {
       // Bybit returns error like "topic:allLiquidation.SYMBOL not found"
       const match = message.ret_msg?.match(/topic:allLiquidation\.([A-Z0-9]+)/);
@@ -233,16 +236,16 @@ class WebsocketClient {
       if (failedSymbol) {
         if (!this.blacklist.has(failedSymbol)) {
           this.blacklist.add(failedSymbol);
-          logger.warn(`Blacklisted ${failedSymbol}: ${message.ret_msg}`);
+          logger.warn(`[liquidationStream] Blacklisted ${failedSymbol}: ${message.ret_msg}`);
         }
         // Retry the rest (excluding the failed one)
         const remaining = symbols.filter((s) => s !== failedSymbol);
         if (remaining.length > 0) {
-          logger.info(`Retrying ${remaining.length} symbols after removing ${failedSymbol}`);
+          logger.info(`[liquidationStream] Retrying ${remaining.length} symbol(s) after removing ${failedSymbol}`);
           this._sendSubscribe(remaining);
         }
       } else {
-        logger.error('Batch subscription failed — retrying all', { ret_msg: message.ret_msg, symbols });
+        logger.error('[liquidationStream] Batch subscription failed — retrying all', { ret_msg: message.ret_msg, symbols });
         this._sendSubscribe(symbols);
       }
     }
@@ -263,7 +266,7 @@ class WebsocketClient {
     });
 
     if (filtered.length === 0) {
-      logger.debug('No new symbols to subscribe');
+      logger.debug('[liquidationStream] No new symbols to subscribe');
       return;
     }
 
@@ -272,7 +275,7 @@ class WebsocketClient {
     const topics = filtered.map((s) => `allLiquidation.${s}`);
     const message = JSON.stringify({ op: 'subscribe', args: topics });
 
-    logger.info(`Subscribing to ${filtered.length} symbols`);
+    logger.info(`[liquidationStream] Subscribing to ${filtered.length} symbol(s)`);
     this._send(message);
   }
 
@@ -286,6 +289,35 @@ class WebsocketClient {
   }
 
   /**
+   * Unsubscribe from a batch of symbols.
+   * @param {string[]} symbols
+   */
+  unsubscribeMany(symbols) {
+    const toRemove = [];
+    for (const s of symbols) {
+      if (this.subscribedSymbols.has(s)) {
+        toRemove.push(s);
+      }
+    }
+
+    if (toRemove.length === 0) {
+      logger.debug('[liquidationStream] No symbols to unsubscribe');
+      return;
+    }
+
+    const topics = toRemove.map((s) => `allLiquidation.${s}`);
+    const message = JSON.stringify({ op: 'unsubscribe', args: topics });
+
+    logger.info(`[liquidationStream] Unsubscribing from ${toRemove.length} symbol(s)`);
+    this._send(message);
+
+    // Remove from tracking immediately — don't wait for confirmation
+    for (const s of toRemove) {
+      this.subscribedSymbols.delete(s);
+    }
+  }
+
+  /**
    * Send a raw JSON string over the WebSocket.
    * @param {string} data
    */
@@ -293,7 +325,7 @@ class WebsocketClient {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(data);
     } else {
-      logger.warn(`Cannot send — WS state: ${this.ws?.readyState ?? 'null'}`);
+      logger.warn(`[liquidationStream] Cannot send — WS state: ${this.ws?.readyState ?? 'null'}`);
     }
   }
 
@@ -310,12 +342,12 @@ class WebsocketClient {
    */
   _handleReconnect() {
     if (!this.shouldReconnect) {
-      logger.info('Reconnection disabled');
+      logger.info('[liquidationStream] Reconnection disabled');
       return;
     }
 
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      logger.error(`Max reconnect attempts (${this.maxReconnectAttempts}) reached — giving up`);
+      logger.error(`[liquidationStream] Max reconnect attempts (${this.maxReconnectAttempts}) reached — giving up`);
       this.shouldReconnect = false;
       return;
     }
@@ -326,11 +358,11 @@ class WebsocketClient {
       this.maxReconnectDelay
     );
 
-    logger.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    logger.info(`[liquidationStream] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
     setTimeout(() => {
       this.connect().catch((err) => {
-        logger.error('Reconnection failed', { error: err.message });
+        logger.error('[liquidationStream] Reconnection failed', { error: err.message });
       });
     }, delay);
   }
@@ -348,7 +380,7 @@ class WebsocketClient {
    * Graceful shutdown.
    */
   async shutdown() {
-    logger.info('Shutting down WebSocket');
+    logger.info('[liquidationStream] Shutting down');
     this.shouldReconnect = false;
     this.isConnected = false;
 
@@ -362,7 +394,7 @@ class WebsocketClient {
     this.subscribedSymbols.clear();
     this.currentBatchRequest = null;
     this.messageHandlers = [];
-    logger.info('WebSocket shutdown complete');
+    logger.info('[liquidationStream] Shutdown complete');
   }
 
   /**
@@ -380,5 +412,5 @@ class WebsocketClient {
 }
 
 // Singleton
-const wsClient = new WebsocketClient();
-export default wsClient;
+const liquidationStreamService = new LiquidationStreamService();
+export default liquidationStreamService;

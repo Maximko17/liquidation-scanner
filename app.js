@@ -1,10 +1,11 @@
 import logger from './utils/logger.js';
 import config from './config/index.js';
 import symbolService from './services/symbolService.js';
-import wsClient from './services/websocketClient.js';
+import liquidationStreamService from './services/liquidationStreamService.js';
 import tracker from './services/liquidationTracker.js';
 import alertService from './services/alertService.js';
 import reactionTracker from './services/signalReactionTracker.js';
+import priceStreamService from './services/priceStreamService.js';
 
 /**
  * Bybit Liquidation Monitoring System
@@ -21,7 +22,7 @@ import reactionTracker from './services/signalReactionTracker.js';
 // ── Wire callbacks ──────────────────────────────────────────────
 
 // WebSocket events → tracker
-wsClient.onMessage((event) => {
+liquidationStreamService.onMessage((event) => {
   tracker.handleEvent(event);
 });
 
@@ -60,26 +61,40 @@ async function start() {
 
   // 2. Connect WebSocket
   try {
-    await wsClient.connect();
+    await liquidationStreamService.connect();
   } catch (error) {
-  logger.error('Failed to connect WebSocket', { error: error.message });
+  logger.error('Failed to connect liquidation stream', { error: error.message });
     process.exit(1);
   }
 
-  // 3. Subscribe to all symbols
-  wsClient.subscribeMany(symbolNames);
+  // 3. Subscribe to all symbols (liquidation stream)
+  liquidationStreamService.subscribeMany(symbolNames);
 
-  // 4. Start the liquidation tracker tick
+  // 4. Start price stream (separate WS for tickers)
+  try {
+    await priceStreamService.connect();
+    priceStreamService.subscribeMany(symbolNames);
+  } catch (error) {
+    logger.error('Failed to connect price stream', { error: error.message });
+  }
+
+  // 5. Start the liquidation tracker tick
   tracker.start();
 
-  // 5. Schedule periodic symbol refresh to pick up new listings
+  // 6. Schedule periodic symbol refresh to pick up new listings
   setInterval(async () => {
     try {
       logger.debug('Running scheduled symbol refresh...');
-      const { added } = await symbolService.refreshSymbols();
+      const { added, removed } = await symbolService.refreshSymbols();
+      if (removed.length > 0) {
+        logger.info(`Symbols removed, unsubscribing: ${removed.join(', ')}`);
+        liquidationStreamService.unsubscribeMany(removed);
+        priceStreamService.unsubscribeMany(removed);
+      }
       if (added.length > 0) {
         logger.info(`New symbols detected, subscribing: ${added.join(', ')}`);
-        wsClient.subscribeMany(added);
+        liquidationStreamService.subscribeMany(added);
+        priceStreamService.subscribeMany(added);
       }
     } catch (error) {
       logger.error('Scheduled symbol refresh failed', { error: error.message });
@@ -99,7 +114,8 @@ async function shutdown(signal) {
 
   tracker.stop();
   reactionTracker.stop();
-  await wsClient.shutdown();
+  priceStreamService.stop();
+  await liquidationStreamService.shutdown();
 
   logger.info('Shutdown complete');
   process.exit(0);

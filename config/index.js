@@ -55,6 +55,11 @@ export default {
   WS_RECONNECT_DELAY: parseInt(process.env.WS_RECONNECT_DELAY, 10) || 5_000,
   WS_PING_INTERVAL_MS: parseInt(process.env.WS_PING_INTERVAL_MS, 10) || 20_000,
 
+  // ── Price Stream (WS-based price buffer) ──────────
+  PRICE_WS_URL: process.env.PRICE_WS_URL || 'wss://stream.bybit.com/v5/public/linear',
+  PRICE_BUFFER_MAX_AGE_MS: parseInt(process.env.PRICE_BUFFER_MAX_AGE_MS, 10) || 120_000,
+  PRICE_THROTTLE_MS: parseInt(process.env.PRICE_THROTTLE_MS, 10) || 1_000,
+
   // ── Windows & Timing ──────────────────────────────────
   BUFFER_DURATION_MS: parseInt(process.env.BUFFER_DURATION_MS, 10) || 20_000,
   WINDOW_SIZE_MS: parseInt(process.env.WINDOW_SIZE_MS, 10) || 3_000,
