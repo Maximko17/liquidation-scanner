@@ -183,12 +183,12 @@ class SignalReactionTracker {
 
     // ── OI interpretation ──────────────────────────────────
     let oiLabel;
-    if (dOI > 0.5) {
-      oiLabel = '🟢 OI: new positions entering';
-    } else if (dOI < -0.5) {
-      oiLabel = '🔴 OI: positions closing';
+    if (dOI > 0.2) {
+      oiLabel = `ΔOI: ${this._fmtPct(dOI)} 🟢 entering`;
+    } else if (dOI < -0.2) {
+      oiLabel = `ΔOI: ${this._fmtPct(dOI)} 🔴 closing`;
     } else {
-      oiLabel = '⚪ OI: unchanged';
+      oiLabel = `ΔOI: ${this._fmtPct(dOI)} (unchanged)`;
     }
 
     // ── Market context (price ranges from ticker buffer) ──
@@ -390,7 +390,6 @@ class SignalReactionTracker {
       `Δ5s:  ${this._fmtPct(reaction.dp5)}`,
       `Δ15s: ${this._fmtPct(reaction.dp15)}`,
       `Δ60s: ${this._fmtPct(reaction.dp60)}`,
-      `ΔOI:  ${this._fmtPct(reaction.dOI)}`,
       ...contextLines,
       ``,
       `→ ${reaction.classification}`,
