@@ -153,7 +153,7 @@ class SignalReactionTracker {
     const targetTime = state.startTime + 60_000;
     const snap = priceStreamService.getClosestSnapshot(state.symbol, targetTime);
     state.price_60s = snap?.price ?? state.price_15s ?? state.price_0;
-    state.oi_60s = snap?.openInterest ?? state.oi_0;
+    state.oi_60s = snap?.openInterest || state.oi_0;
     logger.debug(`Reaction ${state.id}: price_60s=${state.price_60s}, oi_60s=${state.oi_60s}`);
 
     // Classify and emit
@@ -390,11 +390,12 @@ class SignalReactionTracker {
       `Δ5s:  ${this._fmtPct(reaction.dp5)}`,
       `Δ15s: ${this._fmtPct(reaction.dp15)}`,
       `Δ60s: ${this._fmtPct(reaction.dp60)}`,
+      reaction.oiLabel,
       ...contextLines,
       ``,
       `→ ${reaction.classification}`,
-      `${reaction.oiLabel}${confidenceLine}`,
-    ].join('\n');
+      confidenceLine,
+    ].filter(Boolean).join('\n');
   }
 
   /**

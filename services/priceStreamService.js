@@ -26,6 +26,9 @@ class PriceStreamService {
     /** @type {Map<string, number>} symbol → last write timestamp (ms) */
     this.lastWrite = new Map();
 
+    /** @type {Map<string, number>} symbol → last known open interest value */
+    this.lastKnownOI = new Map();
+
     /** @type {Set<string>} */
     this.subscribedSymbols = new Set();
 
@@ -190,6 +193,7 @@ class PriceStreamService {
       this.subscribedSymbols.delete(s);
       this.priceBuffer.delete(s);
       this.lastWrite.delete(s);
+      this.lastKnownOI.delete(s);
     }
   }
 
@@ -247,12 +251,18 @@ class PriceStreamService {
       const symbol = message.topic.replace('tickers.', '');
       const tickerData = message.data;
 
-      // Bybit sends ticker data as an object with fields like lastPrice, openInterestValue
+      // Bybit sends partial ticker updates — only changed fields are present.
+      // Missing openInterestValue means "unchanged", NOT zero/missing.
       if (tickerData && typeof tickerData.lastPrice !== 'undefined') {
+        // Update OI only if field is actually present in this message
+        if (tickerData.openInterestValue !== undefined) {
+          this.lastKnownOI.set(symbol, parseFloat(tickerData.openInterestValue));
+        }
+
         this._onTickerData(
           symbol,
           parseFloat(tickerData.lastPrice) || 0,
-          parseFloat(tickerData.openInterestValue) || 0
+          this.lastKnownOI.get(symbol)
         );
       }
     }
@@ -323,8 +333,9 @@ class PriceStreamService {
       this.priceBuffer.set(symbol, buffer);
     }
 
-    // Push new entry
-    buffer.push({ price, oi, time: now });
+    // Push new entry — fallback to lastKnownOI if oi is undefined (partial update without OI field)
+    const storedOI = oi !== undefined ? oi : (this.lastKnownOI.get(symbol) || 0);
+    buffer.push({ price, oi: storedOI, time: now });
 
     // Clean old entries: while+shift — O(1) amortized
     this._cleanBuffer(symbol, now);
