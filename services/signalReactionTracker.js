@@ -1,5 +1,6 @@
 import priceStreamService from './priceStreamService.js';
 import { scoreReaction } from './signalScorer.js';
+import { analyzeRegime } from './emaService.js';
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
 
@@ -215,6 +216,15 @@ class SignalReactionTracker {
       contextLabel = this._buildContextLabel(position_5m, position_30m, lowData5m, lowData30m);
     }
 
+    // ── EMA regime (calculated ONCE, only here in _finalize) ──
+    const emaResult = analyzeRegime(
+      priceStreamService.priceBuffer,
+      state.symbol,
+      classification,
+      state.side,
+      p60
+    );
+
     /** @type {ReactionResult} */
     const reaction = {
       symbol: state.symbol,
@@ -235,10 +245,12 @@ class SignalReactionTracker {
       lowData5m,
       lowData30m,
       contextLabel,
+      emaResult,
     };
 
     // ── Confidence score ──────────────────────────────────
-    const { score: confidenceScore, label: confidenceLabel } = scoreReaction(reaction);
+    const scorerOptions = emaResult ? { ema: emaResult } : {};
+    const { score: confidenceScore, label: confidenceLabel } = scoreReaction(reaction, scorerOptions);
     reaction.confidenceScore = confidenceScore;
     reaction.confidenceLabel = confidenceLabel;
 
@@ -384,6 +396,12 @@ class SignalReactionTracker {
       ? `\nConfidence: ${reaction.confidenceScore}/10 (${reaction.confidenceLabel})`
       : '';
 
+    // EMA trend lines
+    let emaLines = [];
+    if (reaction.emaResult?.trendLines) {
+      emaLines = ['', 'Trend:', ...reaction.emaResult.trendLines];
+    }
+
     return [
       `📊 ${reaction.symbol} ${typeLabel} (${reaction.ratio.toFixed(1)}x)${mergeNote}`,
       ``,
@@ -392,6 +410,7 @@ class SignalReactionTracker {
       `Δ60s: ${this._fmtPct(reaction.dp60)}`,
       reaction.oiLabel,
       ...contextLines,
+      ...emaLines,
       ``,
       `→ ${reaction.classification}`,
       confidenceLine,

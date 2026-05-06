@@ -35,7 +35,7 @@ function classify(score) {
  * @param {import('./signalReactionTracker.js').ReactionResult} reaction
  * @returns {{ score: number, label: string }}
  */
-export function scoreReaction(reaction) {
+export function scoreReaction(reaction, options = {}) {
   let score = 0;
 
   const { ratio, dp5, dp15, dp60, dOI, position_5m, position_30m, lowData5m, lowData30m, classification } = reaction;
@@ -103,6 +103,12 @@ export function scoreReaction(reaction) {
   const { absThreshold } = getThresholdConfig(reaction.symbol);
   if (typeof reaction.L_now === 'number' && reaction.L_now < absThreshold * 2) {
     score -= 1;
+  }
+
+  // ── F. EMA regime adjustment (±1) ────────────────────
+  const { ema } = options;
+  if (ema?.confidenceAdjustment) {
+    score += ema.confidenceAdjustment;
   }
 
   // ── Normalize & classify ───────────────────────────────
