@@ -10,7 +10,7 @@ import logger from '../utils/logger.js';
  *   1. Captures price_0 and oi_0 at signal time
  *   2. Schedules snapshots at +5s, +15s, +60s
  *   3. Computes ΔP (price deltas) and ΔOI (open interest delta)
- *   4. Classifies the signal: STRONG_CONTINUATION | REVERSAL | ABSORPTION | IGNORE
+ *   4. Classifies the signal: STRONG_CONTINUATION | REVERSAL | ABSORPTION | NO_FOLLOW_THROUGH
  *   5. Sends a secondary alert with the reaction analysis
  *
  * Merge logic for cascading signals:
@@ -261,7 +261,7 @@ class SignalReactionTracker {
    * @param {number} dp5  - ΔP5 in %
    * @param {number} dp15 - ΔP15 in %
    * @param {number} dp60 - ΔP60 in %
-   * @returns {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'IGNORE'}
+   * @returns {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'NO_FOLLOW_THROUGH'}
    */
   _classify(dp5, dp15, dp60) {
     const strong = config.REACTION_DP5_STRONG;
@@ -286,8 +286,8 @@ class SignalReactionTracker {
       return 'ABSORPTION';
     }
 
-    // IGNORE
-    return 'IGNORE';
+    // NO_FOLLOW_THROUGH
+    return 'NO_FOLLOW_THROUGH';
   }
 
   /**
@@ -384,6 +384,9 @@ class SignalReactionTracker {
       ? `\nConfidence: ${reaction.confidenceScore}/10 (${reaction.confidenceLabel})`
       : '';
 
+    // Classification human-readable block
+    const classificationBlock = this._classificationBlock(reaction.classification);
+
     return [
       `📊 ${reaction.symbol} ${typeLabel} (${reaction.ratio.toFixed(1)}x)${mergeNote}`,
       ``,
@@ -393,7 +396,7 @@ class SignalReactionTracker {
       reaction.oiLabel,
       ...contextLines,
       ``,
-      `→ ${reaction.classification}`,
+      ...classificationBlock,
       confidenceLine,
     ].filter(Boolean).join('\n');
   }
@@ -406,6 +409,40 @@ class SignalReactionTracker {
   _fmtPct(value) {
     const sign = value >= 0 ? '+' : '';
     return `${sign}${value.toFixed(2)}%`;
+  }
+
+  /**
+   * Build human-readable classification block (3 lines).
+   * @param {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'NO_FOLLOW_THROUGH'} classification
+   * @returns {string[]}
+   */
+  _classificationBlock(classification) {
+    switch (classification) {
+      case 'STRONG_CONTINUATION':
+        return [
+          '→ STRONG CONTINUATION',
+          '→ market continued liquidation direction',
+          '→ momentum remains strong',
+        ];
+      case 'REVERSAL':
+        return [
+          '→ REVERSAL',
+          '→ market rejected liquidation direction',
+          '→ reversal pressure detected',
+        ];
+      case 'ABSORPTION':
+        return [
+          '→ ABSORPTION',
+          '→ liquidation was absorbed by market',
+          '→ low directional follow-through',
+        ];
+      default:
+        return [
+          '→ NO FOLLOW-THROUGH',
+          '→ liquidation had weak market impact',
+          '→ momentum faded quickly',
+        ];
+    }
   }
 
   /**
@@ -530,7 +567,7 @@ class SignalReactionTracker {
  * @property {number} dp60
  * @property {number} dOI
  * @property {string} oiLabel
- * @property {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'IGNORE'} classification
+ * @property {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'NO_FOLLOW_THROUGH'} classification
  * @property {boolean} merged
  * @property {number} mergeCount
  */

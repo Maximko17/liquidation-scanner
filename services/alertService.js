@@ -44,16 +44,19 @@ class AlertService {
     // ── Build message ────────────────────────────────────
     const typeLabel = side === 'long' ? 'LONG LIQUIDATIONS 🟢' : 'SHORT LIQUIDATIONS 🔴';
 
+    const warmupNote = alert.warmup ? '\n⚠️ Warmup mode (limited history)' : '';
+
     const message = [
       `📊 Symbol: ${symbol}`,
       `📉 Type: ${typeLabel}`,
       `💰 Size (3s): ${formatUSD(L_now)}`,
       `📏 Baseline: ${formatUSD(baseline)}`,
       `📈 Ratio: ${ratio.toFixed(1)}x`,
+      warmupNote,
       ``,
       `🔗 Bybit: https://www.bybit.com/trade/usdt/${symbol}`,
       `🔗 Coinglass: https://www.coinglass.com/tv/${symbol}`,
-    ].join('\n');
+    ].filter(Boolean).join('\n');
 
     logger.info(`Dispatching alert: ${key}`);
 

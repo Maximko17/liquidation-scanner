@@ -1,5 +1,5 @@
 import config, { getThresholdConfig } from '../config/index.js';
-import median from '../utils/median.js';
+import { median, getPercentile } from '../utils/median.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -144,9 +144,12 @@ class LiquidationTracker {
       history.shift();
     }
 
-    // 5. Compute baseline = max(median(history_values), MIN_BASELINE)
+    // 5. Compute baseline = max(percentile75(history_values), MIN_BASELINE)
     const historyValues = history.map((h) => h.value);
-    const baselineRaw = median(historyValues);
+    const isWarmup = history.length < config.MIN_HISTORY_WINDOWS;
+    const baselineRaw = isWarmup
+      ? thresholds.minBaseline  // warmup: use floor directly
+      : getPercentile(historyValues, 0.75);
     const baseline = Math.max(baselineRaw, thresholds.minBaseline);
 
     // 6. Compute threshold
@@ -173,6 +176,7 @@ class LiquidationTracker {
         threshold,
         absThreshold: thresholds.absThreshold,
         timestamp: now,
+        warmup: isWarmup,
       };
 
       logger.info(
@@ -223,7 +227,7 @@ class LiquidationTracker {
         .reduce((sum, evt) => sum + evt.size, 0);
 
       const historyValues = data.history[side].map((h) => h.value);
-      const baselineRaw = median(historyValues);
+      const baselineRaw = getPercentile(historyValues, 0.75);
       const thresholds = getThresholdConfig(symbol);
       const baseline = Math.max(baselineRaw, thresholds.minBaseline);
 

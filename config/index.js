@@ -95,4 +95,10 @@ export default {
   REACTION_ABSORPTION_MAX: parseFloat(process.env.REACTION_ABSORPTION_MAX) || 0.1,
   REACTION_MERGE_WINDOW_MS: parseInt(process.env.REACTION_MERGE_WINDOW_MS, 10) || 10_000,
   REACTION_MAX_ACTIVE_SIGNALS: parseInt(process.env.REACTION_MAX_ACTIVE_SIGNALS, 10) || 3,
+
+  // ── EMA Regime ────────────────────────────────────
+  EMA_RANGE_THRESHOLD: parseFloat(process.env.EMA_RANGE_THRESHOLD) || 0.1,
+
+  // ── Adaptive Baseline ─────────────────────────────
+  MIN_HISTORY_WINDOWS: parseInt(process.env.MIN_HISTORY_WINDOWS, 10) || 50,
 };
