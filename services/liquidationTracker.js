@@ -1,3 +1,4 @@
+import Deque from 'double-ended-queue';
 import config, { getThresholdConfig } from '../config/index.js';
 import { median, getPercentile } from '../utils/median.js';
 import logger from '../utils/logger.js';
@@ -7,16 +8,15 @@ import logger from '../utils/logger.js';
  *
  * Per-symbol data structures:
  *   buffer:  { long: Event[], short: Event[] }        — last BUFFER_DURATION_MS of events
- *   history: { long: HistoryEntry[], short: [...] }    — last HISTORY_DURATION_MS of L_now values
+ *   history: { long: Deque<number>, short: Deque<number> } — last N meaningful non-zero L_now values (event-based FIFO)
  *   prevL:   { long: number, short: number }           — previous tick's L_now (used for threshold crossing)
  *   alertArmed: { long: boolean, short: boolean }     — if false and threshold was crossed up → fire alert
  *
  * Every tick (WINDOW_TICK_MS):
  *   1. For each symbol, sum sizes where now - time ≤ WINDOW_SIZE_MS  → L_long_now, L_short_now
  *   2. Clean old events from buffer
- *   3. Store L_now values in history (with timestamp)
- *   4. Clean old history entries
- *   5. Compute baseline = max(median(history), MIN_BASELINE)
+ *   3. If L_now > MIN_SIZE_EVENT_HISTORY_FILTER → push into history (FIFO cap at EVENT_HISTORY_SIZE)
+ *   4. Compute baseline = max(percentile75(history), MIN_BASELINE)
  *   6. threshold = baseline * RATIO
  *   7. Check crossing: L_now > ABS_THRESHOLD && L_now ≥ threshold && prevL < threshold → ALERT
  *   8. If L_now < threshold → reset check (allow future alerts)
@@ -38,7 +38,7 @@ class LiquidationTracker {
     if (!this.symbols.has(symbol)) {
       this.symbols.set(symbol, {
         buffer: { long: [], short: [] },
-        history: { long: [], short: [] },
+        history: { long: new Deque(), short: new Deque() },
         prevL: { long: 0, short: 0 },
         alertArmed: { long: true, short: true },
       });
@@ -129,27 +129,20 @@ class LiquidationTracker {
     const bufferCutoff = now - config.BUFFER_DURATION_MS;
     data.buffer[side] = events.filter((evt) => evt.time > bufferCutoff);
 
-    // 3. Store L_now in history (always, even if 0)
-    history.push({ value: L_now, timestamp: now });
-
-    // 4. Clean history: remove entries older than HISTORY_DURATION_MS
-    const historyCutoff = now - config.HISTORY_DURATION_MS;
-    while (history.length > 0 && history[0].timestamp < historyCutoff) {
-      history.shift();
+    // 3. Event-based history: store only meaningful non-zero windows
+    if (L_now > config.MIN_SIZE_EVENT_HISTORY_FILTER) {
+      history.push(L_now);
+      // FIFO cap
+      while (history.length > config.EVENT_HISTORY_SIZE) {
+        history.shift();
+      }
     }
 
-    // Cap history to a reasonable size to prevent unbounded growth
-    const maxHistory = Math.ceil(config.HISTORY_DURATION_MS / config.WINDOW_TICK_MS) + 100;
-    while (history.length > maxHistory) {
-      history.shift();
-    }
-
-    // 5. Compute baseline = max(percentile75(history_values), MIN_BASELINE)
-    const historyValues = history.map((h) => h.value);
-    const isWarmup = history.length < config.MIN_HISTORY_WINDOWS;
+    // 4. Compute baseline = max(percentile75(history), MIN_BASELINE)
+    const isWarmup = history.length < config.EVENT_HISTORY_WARMUP_COUNT;
     const baselineRaw = isWarmup
       ? thresholds.minBaseline  // warmup: use floor directly
-      : getPercentile(historyValues, 0.75);
+      : getPercentile(history.toArray(), 0.75);
     const baseline = Math.max(baselineRaw, thresholds.minBaseline);
 
     // 6. Compute threshold
@@ -226,8 +219,8 @@ class LiquidationTracker {
         .filter((evt) => now - evt.time <= config.WINDOW_SIZE_MS)
         .reduce((sum, evt) => sum + evt.size, 0);
 
-      const historyValues = data.history[side].map((h) => h.value);
-      const baselineRaw = getPercentile(historyValues, 0.75);
+      const historyValues = data.history[side];
+      const baselineRaw = getPercentile(historyValues.toArray(), 0.75);
       const thresholds = getThresholdConfig(symbol);
       const baseline = Math.max(baselineRaw, thresholds.minBaseline);
 
@@ -264,15 +257,9 @@ class LiquidationTracker {
  */
 
 /**
- * @typedef {object} HistoryEntry
- * @property {number} value
- * @property {number} timestamp
- */
-
-/**
  * @typedef {object} SymbolData
  * @property {{ long: LiquidationEvent[], short: LiquidationEvent[] }} buffer
- * @property {{ long: HistoryEntry[], short: HistoryEntry[] }} history
+ * @property {{ long: Deque<number>, short: Deque<number> }} history
  * @property {{ long: number, short: number }} prevL
  * @property {{ long: boolean, short: boolean }} alertArmed
  */

@@ -100,5 +100,7 @@ export default {
   EMA_RANGE_THRESHOLD: parseFloat(process.env.EMA_RANGE_THRESHOLD) || 0.1,
 
   // ── Adaptive Baseline ─────────────────────────────
-  MIN_HISTORY_WINDOWS: parseInt(process.env.MIN_HISTORY_WINDOWS, 10) || 50,
+  EVENT_HISTORY_SIZE: parseInt(process.env.EVENT_HISTORY_SIZE, 10) || 50,
+  EVENT_HISTORY_WARMUP_COUNT: parseInt(process.env.EVENT_HISTORY_WARMUP_COUNT, 10) || 30,
+  MIN_SIZE_EVENT_HISTORY_FILTER: parseInt(process.env.MIN_SIZE_EVENT_HISTORY_FILTER, 10) || 1000,
 };
