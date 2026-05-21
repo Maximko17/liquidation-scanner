@@ -38,6 +38,9 @@ class PriceStreamService {
     /** @type {Set<string>|null} symbols awaiting subscribe response */
     this.currentBatchRequest = null;
 
+    /** @type {Array<(symbol: string, price: number) => void>} */
+    this.priceCallbacks = [];
+
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 20;
     this.maxReconnectDelay = 30_000;
@@ -339,6 +342,11 @@ class PriceStreamService {
 
     // Clean old entries: while+shift — O(1) amortized
     this._cleanBuffer(symbol, now);
+
+    // Notify registered listeners of price update
+    for (const cb of this.priceCallbacks) {
+      try { cb(symbol, price); } catch { /* ignore */ }
+    }
   }
 
   /**
@@ -441,6 +449,15 @@ class PriceStreamService {
   }
 
   /**
+   * Register a callback for real-time price updates.
+   * Called on every ticker update with (symbol, price).
+   * @param {(symbol: string, price: number) => void} callback
+   */
+  onPriceUpdate(callback) {
+    this.priceCallbacks.push(callback);
+  }
+
+  /**
    * Graceful shutdown.
    */
   stop() {
@@ -459,6 +476,7 @@ class PriceStreamService {
     this.priceBuffer.clear();
     this.lastWrite.clear();
     this.blacklist.clear();
+    this.priceCallbacks = [];
     this.currentBatchRequest = null;
     logger.info('[priceStream] Shutdown complete');
   }

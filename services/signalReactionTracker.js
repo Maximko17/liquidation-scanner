@@ -9,9 +9,10 @@ import logger from '../utils/logger.js';
  * After a liquidation spike alert is triggered, this module:
  *   1. Captures price_0 and oi_0 at signal time
  *   2. Schedules snapshots at +5s, +15s, +60s
- *   3. Computes ΔP (price deltas) and ΔOI (open interest delta)
- *   4. Classifies the signal: STRONG_CONTINUATION | REVERSAL | ABSORPTION | NO_FOLLOW_THROUGH
- *   5. Sends a secondary alert with the reaction analysis
+ *   3. Tracks impulse retention: extreme price (highest/lowest) via live WS
+ *   4. Computes ΔP (price deltas), ΔOI (open interest delta), retention metrics
+ *   5. Classifies the signal: STRONG_CONTINUATION | REVERSAL | ABSORPTION | NO_FOLLOW_THROUGH
+ *   6. Sends a secondary alert with the reaction analysis
  *
  * Merge logic for cascading signals:
  *   - If a new alert arrives within MERGE_WINDOW_MS (10s) of an active signal
@@ -26,6 +27,9 @@ class SignalReactionTracker {
     this.activeSignals = new Map();
     /** @type {Array<(reaction: ReactionResult) => void>} */
     this.reactionCallbacks = [];
+
+    // Listen to live WebSocket price updates for impulse retention
+    priceStreamService.onPriceUpdate((symbol, price) => this._onPriceTick(symbol, price));
   }
 
   /**
@@ -88,6 +92,7 @@ class SignalReactionTracker {
       price_15s: null,
       price_60s: null,
       oi_60s: null,
+      extremePriceSeen: null,
       timers: { t5: null, t15: null, t60: null, cleanup: null },
       merged: false,
       mergeCount: 0,
@@ -114,6 +119,7 @@ class SignalReactionTracker {
 
     state.price_0 = snap.price;
     state.oi_0 = snap.openInterest;
+    state.extremePriceSeen = snap.price;
     logger.debug(`Reaction ${state.id}: price_0=${state.price_0}, oi_0=${state.oi_0}`);
 
     // Schedule captures
@@ -121,6 +127,35 @@ class SignalReactionTracker {
     state.timers.t15 = setTimeout(() => this._capture15s(state), 15_000);
     state.timers.t60 = setTimeout(() => this._capture60s(state), 60_000);
     state.timers.cleanup = setTimeout(() => this._cleanup(state), 90_000);
+  }
+
+  /**
+   * Event-driven impulse tracking — called on every WebSocket ticker update.
+   * Updates the most favorable price seen during the 60s reaction window.
+   * @param {string} symbol
+   * @param {number} price
+   */
+  _onPriceTick(symbol, price) {
+    const sideMap = this.activeSignals.get(symbol);
+    if (!sideMap) return;
+
+    for (const [, signals] of sideMap) {
+      for (const state of signals) {
+        if (state.extremePriceSeen === null) continue;
+
+        if (state.side === 'short') {
+          // Short liquidation → price squeezes UP → track highest
+          if (price > state.extremePriceSeen) {
+            state.extremePriceSeen = price;
+          }
+        } else {
+          // Long liquidation → price cascades DOWN → track lowest
+          if (price < state.extremePriceSeen) {
+            state.extremePriceSeen = price;
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -171,6 +206,7 @@ class SignalReactionTracker {
     const p60 = state.price_60s ?? p15;
     const oi0 = state.oi_0 || 0;
     const oi60 = state.oi_60s ?? oi0;
+    const extreme = state.extremePriceSeen ?? p0;
 
     // ── Compute deltas (in %) ──────────────────────────────
     const dp5 = p0 > 0 ? ((p5 - p0) / p0) * 100 : 0;
@@ -178,8 +214,23 @@ class SignalReactionTracker {
     const dp60 = p15 > 0 ? ((p60 - p15) / p15) * 100 : 0;
     const dOI = oi0 > 0 ? ((oi60 - oi0) / oi0) * 100 : 0;
 
+    // ── Impulse retention ──────────────────────────────────
+    // maxMove = maximum favorable impulse magnitude (always positive %)
+    const maxMove = state.side === 'short'
+      ? ((extreme - p0) / p0) * 100        // highest price → positive
+      : ((p0 - extreme) / p0) * 100;        // lowest price → positive (invert)
+
+    // finalMove = net result from p0 to p60 (signed %)
+    const finalMove = ((p60 - p0) / p0) * 100;
+
+    const absMax = Math.abs(maxMove);
+    const absFinal = Math.abs(finalMove);
+    const retentionRatio = absMax > 0 ? Math.min(absFinal / absMax, 1) : 0;
+    const retentionPct = Math.round(retentionRatio * 100);
+    const retentionLabel = this._buildRetentionLabel(finalMove, maxMove, retentionRatio, state.side);
+
     // ── Classify ───────────────────────────────────────────
-    const classification = this._classify(dp5, dp15, dp60);
+    const classification = this._classify(dp5, dp15, dp60, state.side);
 
     // ── OI interpretation ──────────────────────────────────
     let oiLabel;
@@ -235,15 +286,21 @@ class SignalReactionTracker {
       lowData5m,
       lowData30m,
       contextLabel,
+      maxMove,
+      finalMove,
+      retentionRatio,
+      retentionPct,
+      retentionLabel,
     };
 
     // ── Confidence score ──────────────────────────────────
-    const { score: confidenceScore, label: confidenceLabel } = scoreReaction(reaction);
+    const { score: confidenceScore, label: confidenceLabel, retentionAdjustment } = scoreReaction(reaction);
     reaction.confidenceScore = confidenceScore;
     reaction.confidenceLabel = confidenceLabel;
+    reaction.retentionAdjustment = retentionAdjustment;
 
     logger.info(
-      `Reaction ${state.id}: ${classification} | ΔP5=${dp5.toFixed(2)}% ΔP15=${dp15.toFixed(2)}% ΔP60=${dp60.toFixed(2)}% ΔOI=${dOI.toFixed(2)}%`
+      `Reaction ${state.id}: ${classification} | ΔP5=${dp5.toFixed(2)}% ΔP15=${dp15.toFixed(2)}% ΔP60=${dp60.toFixed(2)}% ΔOI=${dOI.toFixed(2)}% | retention=${retentionRatio.toFixed(2)}`
     );
 
     // ── Notify listeners ───────────────────────────────────
@@ -258,12 +315,16 @@ class SignalReactionTracker {
 
   /**
    * Classify the post-signal price reaction.
+   * Side-aware: uses sign of dp5 to determine favorable direction,
+   * then compares dp15/dp60 relative to it.
+   *
    * @param {number} dp5  - ΔP5 in %
    * @param {number} dp15 - ΔP15 in %
    * @param {number} dp60 - ΔP60 in %
+   * @param {'long'|'short'} side
    * @returns {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'NO_FOLLOW_THROUGH'}
    */
-  _classify(dp5, dp15, dp60) {
+  _classify(dp5, dp15, dp60, side) {
     const strong = config.REACTION_DP5_STRONG;
     const cont15 = config.REACTION_DP15_CONTINUATION;
     const rev15 = config.REACTION_DP15_REVERSAL;
@@ -271,23 +332,70 @@ class SignalReactionTracker {
     const rev60 = config.REACTION_DP60_REVERSAL;
     const absorbMax = config.REACTION_ABSORPTION_MAX;
 
-    // STRONG_CONTINUATION
-    if (dp5 >= strong && dp15 >= cont15 && dp60 >= cont60) {
+    // Gate: was the initial 5s move strong enough in either direction?
+    if (Math.abs(dp5) < strong) {
+      return 'NO_FOLLOW_THROUGH';
+    }
+
+    // Favorable direction: SHORT → UP (+1), LONG → DOWN (−1)
+    const favDir = side === 'short' ? 1 : -1;
+
+    // dp15 and dp60 projected onto favorable direction
+    const p15 = dp15 * favDir;
+    const p60 = dp60 * favDir;
+
+    // Is price continuing in the favorable direction?
+    const dp15Continues = p15 >= cont15 && p15 >= 0;
+    const dp60Continues = p60 >= cont60 && p60 >= 0;
+
+    // Is price reversing (going opposite to favorable direction)?
+    const dp15Reverses = p15 <= rev15 && p15 <= 0;
+    const dp60Reverses = p60 <= rev60 && p60 <= 0;
+
+    // Is price flat after initial impulse?
+    const dp15Flat = Math.abs(dp15) < absorbMax;
+    const dp60Flat = Math.abs(dp60) < absorbMax;
+
+    if (dp15Continues && dp60Continues) {
       return 'STRONG_CONTINUATION';
     }
 
-    // REVERSAL
-    if (dp5 >= strong && dp15 <= rev15 && dp60 <= rev60) {
+    if (dp15Reverses && dp60Reverses) {
       return 'REVERSAL';
     }
 
-    // ABSORPTION
-    if (dp5 >= strong && Math.abs(dp15) < absorbMax && Math.abs(dp60) < absorbMax) {
+    if (dp15Flat && dp60Flat) {
       return 'ABSORPTION';
     }
 
-    // NO_FOLLOW_THROUGH
     return 'NO_FOLLOW_THROUGH';
+  }
+
+  /**
+   * Build human-readable impulse retention interpretation.
+   * @param {number} finalMove - Net % move from p0 to p60
+   * @param {number} maxMove - Maximum favorable impulse magnitude (positive %)
+   * @param {number} retentionRatio - Clamped 0..1 ratio
+   * @param {'long'|'short'} side
+   * @returns {string[]}
+   */
+  _buildRetentionLabel(finalMove, maxMove, retentionRatio, side) {
+    // FULL REVERSAL — price went opposite direction of max impulse
+    if (side === 'short' && finalMove < 0) {
+      return ['→ market fully rejected move', '→ high reversal probability'];
+    }
+    if (side === 'long' && finalMove > 0) {
+      return ['→ market fully rejected move', '→ high reversal probability'];
+    }
+
+    // Normal retention interpretation
+    if (retentionRatio >= 0.7) {
+      return ['→ market accepted impulse', '→ continuation more likely'];
+    }
+    if (retentionRatio >= 0.3) {
+      return ['→ impulse weakening', '→ mixed continuation'];
+    }
+    return ['→ impulse mostly rejected', '→ likely liquidity sweep'];
   }
 
   /**
@@ -348,13 +456,13 @@ class SignalReactionTracker {
 
   /**
    * Build human-readable type label for a reaction.
-   * LONG liquidation → "LONG SQUEEZE" (shorts got liquidated → price rises)
-   * SHORT liquidation → "SHORT LIQUIDATION CASCADE" (longs got liquidated → price drops)
-   * @param {'long'|'short'} side
+   * side='short' — shorts liquidated → price squeezes UP
+   * side='long'  — longs liquidated → price cascades DOWN
+   * @param {'long'|'short'} side — the liquidated side
    * @returns {string}
    */
   _typeLabel(side) {
-    return side === 'long' ? 'LONG SQUEEZE 🟢' : 'SHORT LIQUIDATION CASCADE 🔴';
+    return side === 'short' ? 'SHORT SQUEEZE 🟢' : 'LONG LIQUIDATION CASCADE 🔴';
   }
 
   /**
@@ -379,13 +487,29 @@ class SignalReactionTracker {
       contextLines.push(reaction.contextLabel);
     }
 
+    // Classification human-readable block
+    const classificationBlock = this._classificationBlock(reaction.classification);
+
+    // Impulse retention block
+    const retentionBlock = reaction.maxMove !== undefined ? [
+      '',
+      '📈 Impulse Retention:',
+      `• Max move: ${this._fmtPct(reaction.maxMove)}`,
+      `• Final move: ${this._fmtPct(reaction.finalMove)}`,
+      `• Impulse retained: ${reaction.retentionPct}%`,
+      '',
+      ...reaction.retentionLabel,
+    ] : [];
+
     // Confidence line
     const confidenceLine = reaction.confidenceScore !== undefined
       ? `\nConfidence: ${reaction.confidenceScore}/10 (${reaction.confidenceLabel})`
       : '';
 
-    // Classification human-readable block
-    const classificationBlock = this._classificationBlock(reaction.classification);
+    // Retention impact line
+    const retentionImpactLine = reaction.retentionAdjustment !== undefined && reaction.retentionAdjustment !== 0
+      ? `Retention impact: ${reaction.retentionAdjustment >= 0 ? '+' : ''}${reaction.retentionAdjustment} (${reaction.retentionAdjustment > 0 ? 'market accepted impulse' : reaction.retentionAdjustment === -2 ? 'full rejection detected' : 'impulse weakened'})`
+      : '';
 
     return [
       `📊 ${reaction.symbol} ${typeLabel} (${reaction.ratio.toFixed(1)}x)${mergeNote}`,
@@ -395,9 +519,11 @@ class SignalReactionTracker {
       `Δ60s: ${this._fmtPct(reaction.dp60)}`,
       reaction.oiLabel,
       ...contextLines,
+      ...retentionBlock,
       ``,
       ...classificationBlock,
       confidenceLine,
+      retentionImpactLine,
     ].filter(Boolean).join('\n');
   }
 
@@ -550,6 +676,7 @@ class SignalReactionTracker {
  * @property {number|null} price_15s
  * @property {number|null} price_60s
  * @property {number|null} oi_60s
+ * @property {number|null} extremePriceSeen
  * @property {{ t5: NodeJS.Timeout|null, t15: NodeJS.Timeout|null, t60: NodeJS.Timeout|null, cleanup: NodeJS.Timeout|null }} timers
  * @property {boolean} merged
  * @property {number} mergeCount
@@ -570,6 +697,11 @@ class SignalReactionTracker {
  * @property {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'NO_FOLLOW_THROUGH'} classification
  * @property {boolean} merged
  * @property {number} mergeCount
+ * @property {number} maxMove
+ * @property {number} finalMove
+ * @property {number} retentionRatio
+ * @property {number} retentionPct
+ * @property {string[]} retentionLabel
  */
 
 // Singleton

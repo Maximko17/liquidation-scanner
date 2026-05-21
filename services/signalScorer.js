@@ -38,7 +38,11 @@ function classify(score) {
 export function scoreReaction(reaction) {
   let score = 0;
 
-  const { ratio, dp5, dp15, dp60, dOI, position_5m, position_30m, lowData5m, lowData30m, classification } = reaction;
+  const {
+    ratio, dp5, dp15, dp60, dOI,
+    position_5m, position_30m, lowData5m, lowData30m,
+    classification, retentionRatio, finalMove, side,
+  } = reaction;
 
   // ── A. Liquidation strength (ratio) ────────────────────
   if (ratio >= 8) {
@@ -50,15 +54,23 @@ export function scoreReaction(reaction) {
   }
 
   // ── B. Price reaction ──────────────────────────────────
+  // Favorable direction multiplier: SHORT → +1 (bullish), LONG → −1 (bearish)
+  const favDir = side === 'short' ? 1 : -1;
+  // Projected deltas onto favorable direction (positive = moving favorably)
+  const dp5f = dp5 * favDir;
+  const dp15f = dp15 * favDir;
+  const dp60f = dp60 * favDir;
+
   if (classification === 'STRONG_CONTINUATION' || classification === 'ABSORPTION') {
-    if (dp5 >= 0.25) score += 1;
-    if (dp15 >= 0.15) score += 2;
-    if (dp60 >= 0.3) score += 2;
+    if (dp5f >= 0.25) score += 1;
+    if (dp15f >= 0.15) score += 2;
+    if (dp60f >= 0.3) score += 2;
   }
 
   if (classification === 'REVERSAL') {
-    if (dp15 <= -0.15) score += 2;
-    if (dp60 <= -0.2) score += 2;
+    // Reversal means price went opposite to favorable direction
+    if (dp15f <= -0.15) score += 2;
+    if (dp60f <= -0.2) score += 2;
   }
 
   // ── C. Open Interest ───────────────────────────────────
@@ -105,11 +117,29 @@ export function scoreReaction(reaction) {
     score -= 1;
   }
 
+  // ── F. Impulse retention adjustment ────────────────────
+  let retentionAdjustment = 0;
+
+  if (typeof retentionRatio === 'number' && typeof finalMove === 'number') {
+    // Full reversal — price went opposite direction of max impulse
+    if ((side === 'short' && finalMove < 0) || (side === 'long' && finalMove > 0)) {
+      retentionAdjustment = -2;
+    } else if (retentionRatio >= 0.7) {
+      retentionAdjustment = +2;
+    } else if (retentionRatio >= 0.3) {
+      retentionAdjustment = 0;
+    } else {
+      retentionAdjustment = -1;
+    }
+  }
+
+  score += retentionAdjustment;
+
   // ── Normalize & classify ───────────────────────────────
   score = Math.max(0, Math.min(10, score));
   const label = classify(score);
 
-  return { score, label };
+  return { score, label, retentionAdjustment };
 }
 
 export { LABELS, classify };
