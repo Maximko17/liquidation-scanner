@@ -64,6 +64,8 @@ export default {
   CONTEXT_SHORT_RANGE_MS: parseInt(process.env.CONTEXT_SHORT_RANGE_MS, 10) || 300_000,
   CONTEXT_MID_RANGE_MS: parseInt(process.env.CONTEXT_MID_RANGE_MS, 10) || 1_800_000,
   CONTEXT_MIN_COVERAGE: parseFloat(process.env.CONTEXT_MIN_COVERAGE) || 0.5,
+  MIN_IMPULSE_FOR_STRUCTURE: parseFloat(process.env.MIN_IMPULSE_FOR_STRUCTURE) || 0.3,
+  MIN_MEANINGFUL_IMPULSE: parseFloat(process.env.MIN_MEANINGFUL_IMPULSE) || 0.3,
 
   // ── Windows & Timing ──────────────────────────────────
   BUFFER_DURATION_MS: parseInt(process.env.BUFFER_DURATION_MS, 10) || 20_000,

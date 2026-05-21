@@ -11,8 +11,9 @@ import logger from '../utils/logger.js';
  *   2. Schedules snapshots at +5s, +15s, +60s
  *   3. Tracks impulse retention: extreme price (highest/lowest) via live WS
  *   4. Computes ΔP (price deltas), ΔOI (open interest delta), retention metrics
- *   5. Classifies the signal: STRONG_CONTINUATION | REVERSAL | ABSORPTION | NO_FOLLOW_THROUGH
- *   6. Sends a secondary alert with the reaction analysis
+ *   5. Analyzes market structure acceptance (post-impulse price zone)
+ *   6. Classifies the signal: STRONG_CONTINUATION | REVERSAL | ABSORPTION | NO_FOLLOW_THROUGH
+ *   7. Sends a secondary alert with the reaction analysis
  *
  * Merge logic for cascading signals:
  *   - If a new alert arrives within MERGE_WINDOW_MS (10s) of an active signal
@@ -223,11 +224,15 @@ class SignalReactionTracker {
     // finalMove = net result from p0 to p60 (signed %)
     const finalMove = ((p60 - p0) / p0) * 100;
 
+    const meaningfulImpulse = Math.abs(maxMove) >= config.MIN_MEANINGFUL_IMPULSE;
+
     const absMax = Math.abs(maxMove);
     const absFinal = Math.abs(finalMove);
-    const retentionRatio = absMax > 0 ? Math.min(absFinal / absMax, 1) : 0;
+    const retentionRatio = meaningfulImpulse && absMax > 0 ? Math.min(absFinal / absMax, 1) : 0;
     const retentionPct = Math.round(retentionRatio * 100);
-    const retentionLabel = this._buildRetentionLabel(finalMove, maxMove, retentionRatio, state.side);
+    const retentionLabel = meaningfulImpulse
+      ? this._buildRetentionLabel(finalMove, maxMove, retentionRatio, state.side)
+      : ['→ no meaningful follow-through', '→ liquidation caused minimal displacement', '→ market mostly ignored the event'];
 
     // ── Classify ───────────────────────────────────────────
     const classification = this._classify(dp5, dp15, dp60, state.side);
@@ -266,6 +271,11 @@ class SignalReactionTracker {
       contextLabel = this._buildContextLabel(position_5m, position_30m, lowData5m, lowData30m);
     }
 
+    // ── Market structure acceptance ────────────────────────
+    const structureAnalysis = this._analyzeStructureAcceptance(
+      state.side, position_30m, retentionRatio, lowData30m, maxMove
+    );
+
     /** @type {ReactionResult} */
     const reaction = {
       symbol: state.symbol,
@@ -291,16 +301,24 @@ class SignalReactionTracker {
       retentionRatio,
       retentionPct,
       retentionLabel,
+      meaningfulImpulse,
+      structureState: structureAnalysis.structureState,
+      structureLabels: structureAnalysis.structureLabels,
+      structureScoreAdjustment: structureAnalysis.structureScoreAdjustment,
     };
 
     // ── Confidence score ──────────────────────────────────
-    const { score: confidenceScore, label: confidenceLabel, retentionAdjustment } = scoreReaction(reaction);
+    const {
+      score: confidenceScore, label: confidenceLabel,
+      retentionAdjustment, structureAdjustment,
+    } = scoreReaction(reaction);
     reaction.confidenceScore = confidenceScore;
     reaction.confidenceLabel = confidenceLabel;
     reaction.retentionAdjustment = retentionAdjustment;
+    reaction.structureAdjustment = structureAdjustment;
 
     logger.info(
-      `Reaction ${state.id}: ${classification} | ΔP5=${dp5.toFixed(2)}% ΔP15=${dp15.toFixed(2)}% ΔP60=${dp60.toFixed(2)}% ΔOI=${dOI.toFixed(2)}% | retention=${retentionRatio.toFixed(2)}`
+      `Reaction ${state.id}: ${classification} | ΔP5=${dp5.toFixed(2)}% ΔP15=${dp15.toFixed(2)}% ΔP60=${dp60.toFixed(2)}% ΔOI=${dOI.toFixed(2)}% | retention=${retentionRatio.toFixed(2)} | structure=${structureAnalysis.structureState}`
     );
 
     // ── Notify listeners ───────────────────────────────────
@@ -369,6 +387,98 @@ class SignalReactionTracker {
     }
 
     return 'NO_FOLLOW_THROUGH';
+  }
+
+  /**
+   * Analyze whether the market structurally accepted the new price zone
+   * after the liquidation impulse.
+   *
+   * Gated by MIN_IMPULSE_FOR_STRUCTURE — tiny moves skip structure analysis.
+   *
+   * @param {'long'|'short'} side
+   * @param {number|null} position30m - Position in 30m range (0..1)
+   * @param {number} retentionRatio - Clamped 0..1
+   * @param {boolean} lowData30m - Whether 30m coverage is below threshold
+   * @param {number} maxMove - Maximum favorable impulse magnitude (positive %)
+   * @returns {{ structureState: string, structureScoreAdjustment: number, structureLabels: string[] }}
+   */
+  _analyzeStructureAcceptance(side, position30m, retentionRatio, lowData30m, maxMove) {
+    // No context data available
+    if (position30m === null) {
+      return { structureState: 'no_context', structureScoreAdjustment: 0, structureLabels: [] };
+    }
+
+    // Impulse too small for meaningful structure analysis
+    if (Math.abs(maxMove) < config.MIN_IMPULSE_FOR_STRUCTURE) {
+      return { structureState: 'insufficient_impulse', structureScoreAdjustment: 0, structureLabels: [] };
+    }
+
+    /** @type {string} */
+    let structureState;
+    /** @type {number} */
+    let structureScoreAdjustment;
+    /** @type {string[]} */
+    let structureLabels;
+
+    if (side === 'short') {
+      // SHORT liquidation → bullish squeeze → look for acceptance near highs
+      if (position30m >= 0.8 && retentionRatio >= 0.7) {
+        structureState = 'breakout_accepted';
+        structureScoreAdjustment = +1;
+        structureLabels = [
+          '→ breakout accepted',
+          '→ price holding near range highs',
+          '→ bullish continuation more likely',
+        ];
+      } else if (position30m >= 0.4) {
+        structureState = 'partial_acceptance';
+        structureScoreAdjustment = 0;
+        structureLabels = [
+          '→ partial breakout',
+          '→ mixed continuation quality',
+        ];
+      } else {
+        structureState = 'failed_breakout';
+        structureScoreAdjustment = -1;
+        structureLabels = [
+          '→ breakout failed',
+          '→ price returned into prior range',
+          '→ squeeze probably rejected',
+        ];
+      }
+    } else {
+      // LONG liquidation → bearish cascade → look for acceptance near lows
+      if (position30m <= 0.2 && retentionRatio >= 0.7) {
+        structureState = 'breakdown_accepted';
+        structureScoreAdjustment = +1;
+        structureLabels = [
+          '→ breakdown accepted',
+          '→ price holding near range lows',
+          '→ bearish continuation more likely',
+        ];
+      } else if (position30m <= 0.6) {
+        structureState = 'partial_acceptance';
+        structureScoreAdjustment = 0;
+        structureLabels = [
+          '→ partial breakdown',
+          '→ mixed continuation quality',
+        ];
+      } else {
+        structureState = 'failed_breakdown';
+        structureScoreAdjustment = -1;
+        structureLabels = [
+          '→ breakdown failed',
+          '→ price recovered back into range',
+          '→ cascade probably rejected',
+        ];
+      }
+    }
+
+    if (lowData30m) {
+      structureLabels.push(' ⚠ low context reliability');
+    }
+
+    return { structureState, structureScoreAdjustment, structureLabels };
   }
 
   /**
@@ -490,16 +600,8 @@ class SignalReactionTracker {
     // Classification human-readable block
     const classificationBlock = this._classificationBlock(reaction.classification);
 
-    // Impulse retention block
-    const retentionBlock = reaction.maxMove !== undefined ? [
-      '',
-      '📈 Impulse Retention:',
-      `• Max move: ${this._fmtPct(reaction.maxMove)}`,
-      `• Final move: ${this._fmtPct(reaction.finalMove)}`,
-      `• Impulse retained: ${reaction.retentionPct}%`,
-      '',
-      ...reaction.retentionLabel,
-    ] : [];
+    // Unified Market Acceptance block (retention + structure merged)
+    const marketAcceptanceBlock = this._buildMarketAcceptanceBlock(reaction);
 
     // Confidence line
     const confidenceLine = reaction.confidenceScore !== undefined
@@ -511,6 +613,11 @@ class SignalReactionTracker {
       ? `Retention impact: ${reaction.retentionAdjustment >= 0 ? '+' : ''}${reaction.retentionAdjustment} (${reaction.retentionAdjustment > 0 ? 'market accepted impulse' : reaction.retentionAdjustment === -2 ? 'full rejection detected' : 'impulse weakened'})`
       : '';
 
+    // Structure impact line
+    const structureImpactLine = reaction.structureAdjustment !== undefined && reaction.structureAdjustment !== 0
+      ? `Structure impact: ${reaction.structureAdjustment >= 0 ? '+' : ''}${reaction.structureAdjustment} (${reaction.structureAdjustment > 0 ? 'price holding near extremes' : 'failed to hold new price zone'})`
+      : '';
+
     return [
       `📊 ${reaction.symbol} ${typeLabel} (${reaction.ratio.toFixed(1)}x)${mergeNote}`,
       ``,
@@ -519,12 +626,48 @@ class SignalReactionTracker {
       `Δ60s: ${this._fmtPct(reaction.dp60)}`,
       reaction.oiLabel,
       ...contextLines,
-      ...retentionBlock,
+      ...marketAcceptanceBlock,
       ``,
       ...classificationBlock,
       confidenceLine,
       retentionImpactLine,
+      structureImpactLine,
     ].filter(Boolean).join('\n');
+  }
+
+  /**
+   * Build unified 🎯 Market Acceptance block combining retention + structure analysis.
+   * @param {ReactionResult} reaction
+   * @returns {string[]}
+   */
+  _buildMarketAcceptanceBlock(reaction) {
+    if (reaction.maxMove === undefined) return [];
+
+    const lines = [
+      '',
+      '🎯 Market Acceptance:',
+      `• Max move: ${this._fmtPct(reaction.maxMove)}`,
+      `• Final move: ${this._fmtPct(reaction.finalMove)}`,
+      `• Impulse retained: ${reaction.retentionPct}%`,
+    ];
+
+    // Structure sub-section — only if impulse was meaningful and context exists
+    if (
+      reaction.structureState &&
+      reaction.structureState !== 'insufficient_impulse' &&
+      reaction.structureState !== 'no_context' &&
+      reaction.position_30m !== null
+    ) {
+      lines.push(`• 30m Position: ${reaction.position_30m.toFixed(2)}`);
+      lines.push('');
+      lines.push(...reaction.structureLabels);
+    } else {
+      // No structure analysis: show retention-only labels
+      lines.push('');
+      lines.push(...reaction.retentionLabel);
+    }
+
+    return lines;
   }
 
   /**
@@ -697,11 +840,24 @@ class SignalReactionTracker {
  * @property {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'NO_FOLLOW_THROUGH'} classification
  * @property {boolean} merged
  * @property {number} mergeCount
+ * @property {number|null} position_5m
+ * @property {number|null} position_30m
+ * @property {boolean} lowData5m
+ * @property {boolean} lowData30m
+ * @property {string} contextLabel
  * @property {number} maxMove
  * @property {number} finalMove
  * @property {number} retentionRatio
  * @property {number} retentionPct
  * @property {string[]} retentionLabel
+ * @property {boolean} meaningfulImpulse
+ * @property {number} [confidenceScore]
+ * @property {string} [confidenceLabel]
+ * @property {number} [retentionAdjustment]
+ * @property {string} structureState
+ * @property {string[]} structureLabels
+ * @property {number} structureScoreAdjustment
+ * @property {number} [structureAdjustment]
  */
 
 // Singleton

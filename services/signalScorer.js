@@ -120,7 +120,8 @@ export function scoreReaction(reaction) {
   // ── F. Impulse retention adjustment ────────────────────
   let retentionAdjustment = 0;
 
-  if (typeof retentionRatio === 'number' && typeof finalMove === 'number') {
+  // Only score retention when the impulse was meaningful
+  if (reaction.meaningfulImpulse !== false && typeof retentionRatio === 'number' && typeof finalMove === 'number') {
     // Full reversal — price went opposite direction of max impulse
     if ((side === 'short' && finalMove < 0) || (side === 'long' && finalMove > 0)) {
       retentionAdjustment = -2;
@@ -135,11 +136,17 @@ export function scoreReaction(reaction) {
 
   score += retentionAdjustment;
 
+  // ── G. Market structure acceptance adjustment ──────────
+  const structureAdjustment = typeof reaction.structureScoreAdjustment === 'number'
+    ? reaction.structureScoreAdjustment
+    : 0;
+  score += structureAdjustment;
+
   // ── Normalize & classify ───────────────────────────────
   score = Math.max(0, Math.min(10, score));
   const label = classify(score);
 
-  return { score, label, retentionAdjustment };
+  return { score, label, retentionAdjustment, structureAdjustment };
 }
 
 export { LABELS, classify };
