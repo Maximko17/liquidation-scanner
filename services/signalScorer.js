@@ -6,8 +6,11 @@ import { getThresholdConfig } from '../config/index.js';
  * Pure function — evaluates the strength of a liquidation signal
  * using ratio, price reaction, OI delta, and market context.
  *
- * Returns a score 0–10 with a classification label.
+ * Returns a normalized score 0–10 (one decimal) with a classification label.
  */
+
+/** Theoretical maximum raw score (additive sections only, before penalties) */
+const RAW_THEORETICAL_MAX = 14;
 
 /** Score labels by range */
 const LABELS = {
@@ -33,7 +36,7 @@ function classify(score) {
  * Score a reaction result.
  *
  * @param {import('./signalReactionTracker.js').ReactionResult} reaction
- * @returns {{ score: number, label: string }}
+ * @returns {{ score: number, label: string, retentionAdjustment: number, structureAdjustment: number }}
  */
 export function scoreReaction(reaction) {
   let score = 0;
@@ -45,11 +48,13 @@ export function scoreReaction(reaction) {
   } = reaction;
 
   // ── A. Liquidation strength (ratio) ────────────────────
-  if (ratio >= 8) {
+  if (ratio >= 12) {
+    score += 4;
+  } else if (ratio >= 8) {
     score += 3;
-  } else if (ratio >= 6) {
+  } else if (ratio >= 5) {
     score += 2;
-  } else if (ratio >= 4) {
+  } else if (ratio >= 3) {
     score += 1;
   }
 
@@ -63,21 +68,23 @@ export function scoreReaction(reaction) {
 
   if (classification === 'STRONG_CONTINUATION' || classification === 'ABSORPTION') {
     if (dp5f >= 0.25) score += 1;
-    if (dp15f >= 0.15) score += 2;
-    if (dp60f >= 0.3) score += 2;
+    if (dp15f >= 0.15) score += 1;
+    if (dp60f >= 0.3) score += 1;
   }
 
   if (classification === 'REVERSAL') {
     // Reversal means price went opposite to favorable direction
-    if (dp15f <= -0.15) score += 2;
-    if (dp60f <= -0.2) score += 2;
+    if (dp15f <= -0.15) score += 1;
+    if (dp60f <= -0.2) score += 1;
   }
 
   // ── C. Open Interest ───────────────────────────────────
-  if (dOI > 1) {
+  if (dOI > 2) {
+    score += 2;
+  } else if (dOI > 1) {
     score += 1;
-  } else if (dOI < -1) {
-    // positions closing — neutral (no bonus)
+  } else if (dOI < -2) {
+    score -= 1;
   }
 
   // ── D. Market context (multi-timeframe) ────────────────
@@ -142,11 +149,18 @@ export function scoreReaction(reaction) {
     : 0;
   score += structureAdjustment;
 
-  // ── Normalize & classify ───────────────────────────────
-  score = Math.max(0, Math.min(10, score));
-  const label = classify(score);
+  // ── Hard cap for weak impulses ─────────────────────────
+  if (reaction.meaningfulImpulse === false) {
+    score = Math.min(score, 4);
+  }
 
-  return { score, label, retentionAdjustment, structureAdjustment };
+  // ── Normalize & classify ───────────────────────────────
+  const normalizedScore = (score / RAW_THEORETICAL_MAX) * 10;
+  const roundedScore = Math.round(normalizedScore * 10) / 10;
+  const finalScore = Math.max(0, Math.min(10, roundedScore));
+  const label = classify(finalScore);
+
+  return { score: finalScore, label, retentionAdjustment, structureAdjustment };
 }
 
 export { LABELS, classify };
