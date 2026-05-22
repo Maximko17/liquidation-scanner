@@ -613,11 +613,6 @@ class SignalReactionTracker {
       ? `Retention impact: ${reaction.retentionAdjustment >= 0 ? '+' : ''}${reaction.retentionAdjustment} (${reaction.retentionAdjustment > 0 ? 'market accepted impulse' : reaction.retentionAdjustment === -2 ? 'full rejection detected' : 'impulse weakened'})`
       : '';
 
-    // Structure impact line
-    const structureImpactLine = reaction.structureAdjustment !== undefined && reaction.structureAdjustment !== 0
-      ? `Structure impact: ${reaction.structureAdjustment >= 0 ? '+' : ''}${reaction.structureAdjustment} (${reaction.structureAdjustment > 0 ? 'price holding near extremes' : 'failed to hold new price zone'})`
-      : '';
-
     return [
       `📊 ${reaction.symbol} ${typeLabel} (${reaction.ratio.toFixed(1)}x)${mergeNote}`,
       ``,
@@ -631,43 +626,68 @@ class SignalReactionTracker {
       ...classificationBlock,
       confidenceLine,
       retentionImpactLine,
-      structureImpactLine,
     ].filter(Boolean).join('\n');
   }
 
   /**
-   * Build unified 🎯 Market Acceptance block combining retention + structure analysis.
+   * Build unified Market Acceptance block (retention + structure, trader-readable).
+   * Hierarchical: weak reactions get a minimal block, meaningful moves get full analysis.
    * @param {ReactionResult} reaction
    * @returns {string[]}
    */
   _buildMarketAcceptanceBlock(reaction) {
     if (reaction.maxMove === undefined) return [];
 
-    const lines = [
-      '',
-      '🎯 Market Acceptance:',
-      `• Max move: ${this._fmtPct(reaction.maxMove)}`,
-      `• Final move: ${this._fmtPct(reaction.finalMove)}`,
-      `• Impulse retained: ${reaction.retentionPct}%`,
-    ];
+    // ── WEAK reaction: no metrics, minimal interpretation ──
+    if (reaction.meaningfulImpulse === false) {
+      return [
+        '',
+        '📉 Weak Market Reaction',
+        '',
+        ...reaction.retentionLabel,
+      ];
+    }
 
-    // Structure sub-section — only if impulse was meaningful and context exists
-    if (
+    // ── MEANINGFUL reaction: hierarchical display ─────────
+    const hasStructure =
       reaction.structureState &&
       reaction.structureState !== 'insufficient_impulse' &&
       reaction.structureState !== 'no_context' &&
-      reaction.position_30m !== null
-    ) {
-      lines.push(`• 30m Position: ${reaction.position_30m.toFixed(2)}`);
-      lines.push('');
-      lines.push(...reaction.structureLabels);
+      reaction.position_30m !== null;
+
+    // Pick title and body based on structure outcome
+    let title, bodyLines;
+
+    if (hasStructure) {
+      const isAccepted = reaction.structureState === 'breakout_accepted' || reaction.structureState === 'breakdown_accepted';
+      const isFailed = reaction.structureState === 'failed_breakout' || reaction.structureState === 'failed_breakdown';
+
+      if (isAccepted) {
+        title = '📈 Market Acceptance';
+      } else if (isFailed) {
+        title = reaction.structureState === 'failed_breakout' ? '📉 Failed Breakout' : '📉 Failed Breakdown';
+      } else {
+        title = '📊 Partial Acceptance';
+      }
+
+      bodyLines = [
+        '',
+        `• Impulse retained: ${reaction.retentionPct}%`,
+        '',
+        ...reaction.structureLabels,
+      ];
     } else {
-      // No structure analysis: show retention-only labels
-      lines.push('');
-      lines.push(...reaction.retentionLabel);
+      // No structure context available — retention-only
+      title = '📈 Market Acceptance';
+      bodyLines = [
+        '',
+        `• Impulse retained: ${reaction.retentionPct}%`,
+        '',
+        ...reaction.retentionLabel,
+      ];
     }
 
-    return lines;
+    return ['', title, ...bodyLines];
   }
 
   /**
