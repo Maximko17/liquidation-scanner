@@ -92,6 +92,8 @@ class SignalReactionTracker {
       price_5s: null,
       price_15s: null,
       price_60s: null,
+      oi_5s: null,
+      oi_15s: null,
       oi_60s: null,
       extremePriceSeen: null,
       timers: { t5: null, t15: null, t60: null, cleanup: null },
@@ -167,7 +169,8 @@ class SignalReactionTracker {
     const targetTime = state.startTime + 5_000;
     const snap = priceStreamService.getClosestSnapshot(state.symbol, targetTime);
     state.price_5s = snap?.price ?? state.price_0;
-    logger.debug(`Reaction ${state.id}: price_5s=${state.price_5s}`);
+    state.oi_5s = snap?.openInterest || state.oi_0;
+    logger.debug(`Reaction ${state.id}: price_5s=${state.price_5s}, oi_5s=${state.oi_5s}`);
   }
 
   /**
@@ -178,7 +181,8 @@ class SignalReactionTracker {
     const targetTime = state.startTime + 15_000;
     const snap = priceStreamService.getClosestSnapshot(state.symbol, targetTime);
     state.price_15s = snap?.price ?? state.price_5s ?? state.price_0;
-    logger.debug(`Reaction ${state.id}: price_15s=${state.price_15s}`);
+    state.oi_15s = snap?.openInterest || state.oi_5s || state.oi_0;
+    logger.debug(`Reaction ${state.id}: price_15s=${state.price_15s}, oi_15s=${state.oi_15s}`);
   }
 
   /**
@@ -215,6 +219,13 @@ class SignalReactionTracker {
     const dp60 = p15 > 0 ? ((p60 - p15) / p15) * 100 : 0;
     const dOI = oi0 > 0 ? ((oi60 - oi0) / oi0) * 100 : 0;
 
+    // ── Temporal OI deltas ────────────────────────────────
+    const oi5 = state.oi_5s ?? oi0;
+    const oi15 = state.oi_15s ?? oi5;
+    const dOI5 = oi0 > 0 ? ((oi5 - oi0) / oi0) * 100 : 0;
+    const dOI15 = oi0 > 0 ? ((oi15 - oi0) / oi0) * 100 : 0;
+    const dOI60 = oi0 > 0 ? ((oi60 - oi0) / oi0) * 100 : 0;
+
     // ── Impulse retention ──────────────────────────────────
     // maxMove = maximum favorable impulse magnitude (always positive %)
     const maxMove = state.side === 'short'
@@ -248,9 +259,10 @@ class SignalReactionTracker {
     }
 
     // ── Market context (price ranges from ticker buffer) ──
-    const now = Date.now();
-    const range5m = priceStreamService.getRange(state.symbol, config.CONTEXT_SHORT_RANGE_MS, now);
-    const range30m = priceStreamService.getRange(state.symbol, config.CONTEXT_MID_RANGE_MS, now);
+    // Use pre-event time to exclude the liquidation move itself from the range
+    const preEventTime = state.startTime - 1_000;
+    const range5m = priceStreamService.getRange(state.symbol, config.CONTEXT_SHORT_RANGE_MS, preEventTime);
+    const range30m = priceStreamService.getRange(state.symbol, config.CONTEXT_MID_RANGE_MS, preEventTime);
 
     let position_5m = null;
     let position_30m = null;
@@ -287,6 +299,9 @@ class SignalReactionTracker {
       dp15,
       dp60,
       dOI,
+      dOI5,
+      dOI15,
+      dOI60,
       oiLabel,
       classification,
       merged: state.merged,
@@ -613,13 +628,25 @@ class SignalReactionTracker {
       ? `Retention impact: ${reaction.retentionAdjustment >= 0 ? '+' : ''}${reaction.retentionAdjustment} (${reaction.retentionAdjustment > 0 ? 'market accepted impulse' : reaction.retentionAdjustment === -2 ? 'full rejection detected' : 'impulse weakened'})`
       : '';
 
+    // Temporal OI breakdown
+    const oiLines = ['ΔOI:'];
+    if (typeof reaction.dOI5 === 'number') {
+      oiLines.push(`• 5s:  ${this._fmtPct(reaction.dOI5)}`);
+    }
+    if (typeof reaction.dOI15 === 'number') {
+      oiLines.push(`• 15s: ${this._fmtPct(reaction.dOI15)}`);
+    }
+    if (typeof reaction.dOI60 === 'number') {
+      oiLines.push(`• 60s: ${this._fmtPct(reaction.dOI60)}`);
+    }
+
     return [
       `📊 ${reaction.symbol} ${typeLabel} (${reaction.ratio.toFixed(1)}x)${mergeNote}`,
       ``,
       `Δ5s:  ${this._fmtPct(reaction.dp5)}`,
       `Δ15s: ${this._fmtPct(reaction.dp15)}`,
       `Δ60s: ${this._fmtPct(reaction.dp60)}`,
-      reaction.oiLabel,
+      ...oiLines,
       ...contextLines,
       ...marketAcceptanceBlock,
       ``,
@@ -838,6 +865,8 @@ class SignalReactionTracker {
  * @property {number|null} price_5s
  * @property {number|null} price_15s
  * @property {number|null} price_60s
+ * @property {number|null} oi_5s
+ * @property {number|null} oi_15s
  * @property {number|null} oi_60s
  * @property {number|null} extremePriceSeen
  * @property {{ t5: NodeJS.Timeout|null, t15: NodeJS.Timeout|null, t60: NodeJS.Timeout|null, cleanup: NodeJS.Timeout|null }} timers
@@ -856,6 +885,9 @@ class SignalReactionTracker {
  * @property {number} dp15
  * @property {number} dp60
  * @property {number} dOI
+ * @property {number} dOI5
+ * @property {number} dOI15
+ * @property {number} dOI60
  * @property {string} oiLabel
  * @property {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'NO_FOLLOW_THROUGH'} classification
  * @property {boolean} merged
