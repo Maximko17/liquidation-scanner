@@ -9,11 +9,10 @@ import logger from '../utils/logger.js';
  * After a liquidation spike alert is triggered, this module:
  *   1. Captures price_0 and oi_0 at signal time
  *   2. Schedules snapshots at +5s, +15s, +60s
- *   3. Tracks impulse retention: extreme price (highest/lowest) via live WS
- *   4. Computes ΔP (price deltas), ΔOI (open interest delta), retention metrics
- *   5. Analyzes market structure acceptance (post-impulse price zone)
- *   6. Classifies the signal: STRONG_CONTINUATION | REVERSAL | ABSORPTION | NO_FOLLOW_THROUGH
- *   7. Sends a secondary alert with the reaction analysis
+ *   3. Tracks path geometry: favorable extreme, adverse extreme, time-to-MFE
+ *   4. Computes path quality metrics: MFE, MAE, finalMove, retention, efficiency
+ *   5. Derives a human-readable path label from geometry (not rigid rules)
+ *   6. Sends a secondary alert with the path analysis
  *
  * Merge logic for cascading signals:
  *   - If a new alert arrives within MERGE_WINDOW_MS (10s) of an active signal
@@ -22,6 +21,42 @@ import logger from '../utils/logger.js';
  *   - Max MAX_ACTIVE_SIGNALS (3) per symbol+side
  */
 
+/**
+ * Derive a human-readable path label from geometry metrics.
+ * This is for display only — scoring uses continuous metrics, not this label.
+ *
+ * @param {object} params
+ * @param {number} params.mfe
+ * @param {number} params.mae
+ * @param {number} params.finalMove
+ * @param {number|null} params.retention
+ * @param {number} params.efficiency
+ * @param {boolean} params.isSweep
+ * @param {string} params.momentumPhase
+ * @param {boolean} params.hasMeaningfulImpulse
+ * @returns {string}
+ */
+function derivePathLabel({ mfe, mae, finalMove, retention, efficiency, isSweep, momentumPhase, hasMeaningfulImpulse }) {
+  if (!hasMeaningfulImpulse) {
+    if (mae < 0.2) return 'dead_reaction';
+    return 'absorbed';
+  }
+
+  if (isSweep) return 'liquidity_sweep';
+
+  if (finalMove < 0 && Math.abs(finalMove) > mfe * 0.5) return 'failed_move';
+
+  if (efficiency > 0.7 && retention !== null && retention > 0.7) {
+    return momentumPhase === 'late_peak' ? 'building_continuation' : 'clean_continuation';
+  }
+
+  if (efficiency > 0.4 && retention !== null && retention > 0.4) return 'partial_continuation';
+
+  if (mae > mfe * 0.6) return 'whipsaw';
+
+  return 'weak_continuation';
+}
+
 class SignalReactionTracker {
   constructor() {
     /** @type {Map<string, Map<string, SignalState[]>>} symbol → side → active signals */
@@ -29,19 +64,16 @@ class SignalReactionTracker {
     /** @type {Array<(reaction: ReactionResult) => void>} */
     this.reactionCallbacks = [];
 
-    // Listen to live WebSocket price updates for impulse retention
     priceStreamService.onPriceUpdate((symbol, price) => this._onPriceTick(symbol, price));
   }
 
   /**
    * Entry point: called when liquidationTracker fires an alert.
-   * Applies merge logic for cascading signals within the merge window.
    * @param {import('./liquidationTracker.js').LiquidationAlert} alert
    */
   startTracking(alert) {
     const { symbol, side, L_now, ratio, timestamp } = alert;
 
-    // ── 1. Get (or create) the symbol+side bucket ──────────
     if (!this.activeSignals.has(symbol)) {
       this.activeSignals.set(symbol, new Map());
     }
@@ -51,11 +83,9 @@ class SignalReactionTracker {
     }
     const signals = sideMap.get(side);
 
-    // ── 2. Check for merge with existing active signal ─────
     const mergeWindow = config.REACTION_MERGE_WINDOW_MS || 10_000;
     for (const existing of signals) {
       if (timestamp - existing.startTime < mergeWindow) {
-        // MERGE: update existing signal
         existing.L_now += L_now;
         existing.ratio = Math.max(existing.ratio, ratio);
         existing.lastUpdateTime = timestamp;
@@ -64,11 +94,10 @@ class SignalReactionTracker {
         logger.info(
           `Reaction: merged cascade into ${existing.id} (L=${existing.L_now.toFixed(0)}, ratio=${existing.ratio.toFixed(1)}x, merges=${existing.mergeCount})`
         );
-        return; // Do NOT create a new signal
+        return;
       }
     }
 
-    // ── 3. Limit check: evict oldest if exceeded ───────────
     const maxActive = config.REACTION_MAX_ACTIVE_SIGNALS || 3;
     while (signals.length >= maxActive) {
       const oldest = signals.shift();
@@ -76,7 +105,6 @@ class SignalReactionTracker {
       logger.info(`Reaction: evicted oldest signal ${oldest.id} (limit=${maxActive})`);
     }
 
-    // ── 4. Create new signal state ─────────────────────────
     const id = `${symbol}:${side}:${timestamp}`;
     /** @type {SignalState} */
     const state = {
@@ -96,6 +124,8 @@ class SignalReactionTracker {
       oi_15s: null,
       oi_60s: null,
       extremePriceSeen: null,
+      adverseExtreme: null,
+      timeOfMFE: 0,
       timers: { t5: null, t15: null, t60: null, cleanup: null },
       merged: false,
       mergeCount: 0,
@@ -104,14 +134,9 @@ class SignalReactionTracker {
     signals.push(state);
     logger.info(`Reaction: started tracking ${id} (L=${L_now.toFixed(0)}, ratio=${ratio.toFixed(1)}x)`);
 
-    // ── 5. Init: fetch price_0 + oi_0, then schedule timers ─
     this._initTracking(state);
   }
 
-  /**
-   * Fetch initial price & OI, then schedule 5s/15s/60s/90s timers.
-   * @param {SignalState} state
-   */
   async _initTracking(state) {
     const snap = priceStreamService.getClosestSnapshot(state.symbol, Date.now());
     if (!snap) {
@@ -123,9 +148,9 @@ class SignalReactionTracker {
     state.price_0 = snap.price;
     state.oi_0 = snap.openInterest;
     state.extremePriceSeen = snap.price;
+    state.adverseExtreme = snap.price;
     logger.debug(`Reaction ${state.id}: price_0=${state.price_0}, oi_0=${state.oi_0}`);
 
-    // Schedule captures
     state.timers.t5 = setTimeout(() => this._capture5s(state), 5_000);
     state.timers.t15 = setTimeout(() => this._capture15s(state), 15_000);
     state.timers.t60 = setTimeout(() => this._capture60s(state), 60_000);
@@ -133,10 +158,8 @@ class SignalReactionTracker {
   }
 
   /**
-   * Event-driven impulse tracking — called on every WebSocket ticker update.
-   * Updates the most favorable price seen during the 60s reaction window.
-   * @param {string} symbol
-   * @param {number} price
+   * Event-driven path geometry tracking.
+   * Tracks favorable extreme (MFE), adverse extreme (MAE), and time-to-MFE.
    */
   _onPriceTick(symbol, price) {
     const sideMap = this.activeSignals.get(symbol);
@@ -146,25 +169,29 @@ class SignalReactionTracker {
       for (const state of signals) {
         if (state.extremePriceSeen === null) continue;
 
+        const tickDelta = (Date.now() - state.startTime) / 1000;
+
         if (state.side === 'short') {
-          // Short liquidation → price squeezes UP → track highest
           if (price > state.extremePriceSeen) {
             state.extremePriceSeen = price;
+            state.timeOfMFE = tickDelta;
+          }
+          if (state.adverseExtreme === null || price < state.adverseExtreme) {
+            state.adverseExtreme = price;
           }
         } else {
-          // Long liquidation → price cascades DOWN → track lowest
           if (price < state.extremePriceSeen) {
             state.extremePriceSeen = price;
+            state.timeOfMFE = tickDelta;
+          }
+          if (state.adverseExtreme === null || price > state.adverseExtreme) {
+            state.adverseExtreme = price;
           }
         }
       }
     }
   }
 
-  /**
-   * +5s: capture price_5s.
-   * @param {SignalState} state
-   */
   async _capture5s(state) {
     const targetTime = state.startTime + 5_000;
     const snap = priceStreamService.getClosestSnapshot(state.symbol, targetTime);
@@ -173,10 +200,6 @@ class SignalReactionTracker {
     logger.debug(`Reaction ${state.id}: price_5s=${state.price_5s}, oi_5s=${state.oi_5s}`);
   }
 
-  /**
-   * +15s: capture price_15s.
-   * @param {SignalState} state
-   */
   async _capture15s(state) {
     const targetTime = state.startTime + 15_000;
     const snap = priceStreamService.getClosestSnapshot(state.symbol, targetTime);
@@ -185,10 +208,6 @@ class SignalReactionTracker {
     logger.debug(`Reaction ${state.id}: price_15s=${state.price_15s}, oi_15s=${state.oi_15s}`);
   }
 
-  /**
-   * +60s: capture price_60s and oi_60s, then finalize classification.
-   * @param {SignalState} state
-   */
   async _capture60s(state) {
     const targetTime = state.startTime + 60_000;
     const snap = priceStreamService.getClosestSnapshot(state.symbol, targetTime);
@@ -196,14 +215,9 @@ class SignalReactionTracker {
     state.oi_60s = snap?.openInterest || state.oi_0;
     logger.debug(`Reaction ${state.id}: price_60s=${state.price_60s}, oi_60s=${state.oi_60s}`);
 
-    // Classify and emit
     this._finalize(state);
   }
 
-  /**
-   * Compute deltas, classify, build reaction result, notify listeners.
-   * @param {SignalState} state
-   */
   _finalize(state) {
     const p0 = state.price_0 || 0;
     const p5 = state.price_5s ?? p0;
@@ -212,54 +226,86 @@ class SignalReactionTracker {
     const oi0 = state.oi_0 || 0;
     const oi60 = state.oi_60s ?? oi0;
     const extreme = state.extremePriceSeen ?? p0;
+    const adv = state.adverseExtreme ?? p0;
 
-    // ── Compute deltas (in %) ──────────────────────────────
+    // Price deltas (secondary diagnostics)
     const dp5 = p0 > 0 ? ((p5 - p0) / p0) * 100 : 0;
     const dp15 = p5 > 0 ? ((p15 - p5) / p5) * 100 : 0;
     const dp60 = p15 > 0 ? ((p60 - p15) / p15) * 100 : 0;
-    const dOI = oi0 > 0 ? ((oi60 - oi0) / oi0) * 100 : 0;
 
-    // ── Temporal OI deltas ────────────────────────────────
+    // Temporal OI deltas
     const oi5 = state.oi_5s ?? oi0;
     const oi15 = state.oi_15s ?? oi5;
+    const dOI = oi0 > 0 ? ((oi60 - oi0) / oi0) * 100 : 0;
     const dOI5 = oi0 > 0 ? ((oi5 - oi0) / oi0) * 100 : 0;
     const dOI15 = oi0 > 0 ? ((oi15 - oi0) / oi0) * 100 : 0;
     const dOI60 = oi0 > 0 ? ((oi60 - oi0) / oi0) * 100 : 0;
 
-    // ── Impulse retention ──────────────────────────────────
-    // maxMove = maximum favorable impulse magnitude (always positive %)
-    const maxMove = state.side === 'short'
-      ? ((extreme - p0) / p0) * 100        // highest price → positive
-      : ((p0 - extreme) / p0) * 100;        // lowest price → positive (invert)
+    // ── Path geometry: four core metrics ──────────────────
+    const mfe = state.side === 'short'
+      ? ((extreme - p0) / p0) * 100
+      : ((p0 - extreme) / p0) * 100;
 
-    // finalMove = net result from p0 to p60 (signed %)
-    const finalMove = ((p60 - p0) / p0) * 100;
+    const mae = state.side === 'short'
+      ? ((p0 - adv) / p0) * 100
+      : ((adv - p0) / p0) * 100;
 
-    const meaningfulImpulse = Math.abs(maxMove) >= config.MIN_MEANINGFUL_IMPULSE;
+    const finalMove = state.side === 'short'
+      ? ((p60 - p0) / p0) * 100
+      : ((p0 - p60) / p0) * 100;
 
-    const absMax = Math.abs(maxMove);
-    const absFinal = Math.abs(finalMove);
-    const retentionRatio = meaningfulImpulse && absMax > 0 ? Math.min(absFinal / absMax, 1) : 0;
-    const retentionPct = Math.round(retentionRatio * 100);
-    const retentionLabel = meaningfulImpulse
-      ? this._buildRetentionLabel(finalMove, maxMove, retentionRatio, state.side)
-      : ['→ no meaningful follow-through', '→ liquidation caused minimal displacement', '→ market mostly ignored the event'];
+    const timeToMFE = state.timeOfMFE;
 
-    // ── Classify ───────────────────────────────────────────
-    const classification = this._classify(dp5, dp15, dp60, state.side);
+    // ── Derived path quality indicators ────────────────────
+    // TODO: replace 0.3 with ATR-based threshold per symbol
+    const MIN_MEANINGFUL_MFE = 0.3;
+    const hasMeaningfulImpulse = mfe >= MIN_MEANINGFUL_MFE;
 
-    // ── OI interpretation ──────────────────────────────────
-    let oiLabel;
-    if (dOI > 0.2) {
-      oiLabel = `ΔOI: ${this._fmtPct(dOI)} 🟢 entering`;
-    } else if (dOI < -0.2) {
-      oiLabel = `ΔOI: ${this._fmtPct(dOI)} 🔴 closing`;
+    const retention = hasMeaningfulImpulse
+      ? Math.max(-1, Math.min(1, finalMove / mfe))
+      : null;
+
+    const efficiency = (mfe + mae) > 0
+      ? finalMove / (mfe + mae)
+      : 0;
+
+    const isSweep = hasMeaningfulImpulse
+      && retention !== null
+      && retention < 0.2
+      && timeToMFE < 15
+      && mfe > 2 * mae;
+
+    let momentumPhase;
+    if (!hasMeaningfulImpulse) {
+      momentumPhase = 'no_impulse';
+    } else if (timeToMFE < 15) {
+      momentumPhase = 'early_peak';
+    } else if (timeToMFE >= 45) {
+      momentumPhase = 'late_peak';
     } else {
-      oiLabel = `ΔOI: ${this._fmtPct(dOI)} (unchanged)`;
+      momentumPhase = 'mid_peak';
     }
 
-    // ── Market context (price ranges from ticker buffer) ──
-    // Use pre-event time to exclude the liquidation move itself from the range
+    const pathLabel = derivePathLabel({
+      mfe, mae, finalMove, retention, efficiency,
+      isSweep, momentumPhase, hasMeaningfulImpulse,
+    });
+
+    /** @type {PathQuality} */
+    const pathQuality = {
+      mfe,
+      mae,
+      finalMove,
+      timeToMFE,
+      retention,
+      efficiency,
+      isSweep,
+      momentumPhase,
+      hasMeaningfulImpulse,
+      label: pathLabel,
+    };
+
+    // ── Market context (secondary diagnostics) ─────────────
     const preEventTime = state.startTime - 1_000;
     const range5m = priceStreamService.getRange(state.symbol, config.CONTEXT_SHORT_RANGE_MS, preEventTime);
     const range30m = priceStreamService.getRange(state.symbol, config.CONTEXT_MID_RANGE_MS, preEventTime);
@@ -268,7 +314,6 @@ class SignalReactionTracker {
     let position_30m = null;
     let lowData5m = false;
     let lowData30m = false;
-    let contextLabel = '';
 
     if (range5m && range5m.high !== range5m.low) {
       position_5m = (p60 - range5m.low) / (range5m.high - range5m.low);
@@ -278,15 +323,6 @@ class SignalReactionTracker {
       position_30m = (p60 - range30m.low) / (range30m.high - range30m.low);
       lowData30m = range30m.coverage < config.CONTEXT_MIN_COVERAGE;
     }
-
-    if (position_5m !== null && position_30m !== null) {
-      contextLabel = this._buildContextLabel(position_5m, position_30m, lowData5m, lowData30m);
-    }
-
-    // ── Market structure acceptance ────────────────────────
-    const structureAnalysis = this._analyzeStructureAcceptance(
-      state.side, position_30m, retentionRatio, lowData30m, maxMove
-    );
 
     /** @type {ReactionResult} */
     const reaction = {
@@ -302,41 +338,24 @@ class SignalReactionTracker {
       dOI5,
       dOI15,
       dOI60,
-      oiLabel,
-      classification,
       merged: state.merged,
       mergeCount: state.mergeCount,
       position_5m,
       position_30m,
       lowData5m,
       lowData30m,
-      contextLabel,
-      maxMove,
-      finalMove,
-      retentionRatio,
-      retentionPct,
-      retentionLabel,
-      meaningfulImpulse,
-      structureState: structureAnalysis.structureState,
-      structureLabels: structureAnalysis.structureLabels,
-      structureScoreAdjustment: structureAnalysis.structureScoreAdjustment,
+      pathQuality,
     };
 
     // ── Confidence score ──────────────────────────────────
-    const {
-      score: confidenceScore, label: confidenceLabel,
-      retentionAdjustment, structureAdjustment,
-    } = scoreReaction(reaction);
+    const { score: confidenceScore, label: confidenceLabel } = scoreReaction(reaction);
     reaction.confidenceScore = confidenceScore;
     reaction.confidenceLabel = confidenceLabel;
-    reaction.retentionAdjustment = retentionAdjustment;
-    reaction.structureAdjustment = structureAdjustment;
 
     logger.info(
-      `Reaction ${state.id}: ${classification} | ΔP5=${dp5.toFixed(2)}% ΔP15=${dp15.toFixed(2)}% ΔP60=${dp60.toFixed(2)}% ΔOI=${dOI.toFixed(2)}% | retention=${retentionRatio.toFixed(2)} | structure=${structureAnalysis.structureState}`
+      `Reaction ${state.id}: ${pathLabel} | MFE=${mfe.toFixed(2)}% MAE=${mae.toFixed(2)}% final=${finalMove.toFixed(2)}% ret=${retention !== null ? retention.toFixed(2) : 'N/A'} eff=${efficiency.toFixed(2)} tMFE=${timeToMFE.toFixed(1)}s`
     );
 
-    // ── Notify listeners ───────────────────────────────────
     for (const cb of this.reactionCallbacks) {
       try {
         cb(reaction);
@@ -346,246 +365,6 @@ class SignalReactionTracker {
     }
   }
 
-  /**
-   * Classify the post-signal price reaction.
-   * Side-aware: uses sign of dp5 to determine favorable direction,
-   * then compares dp15/dp60 relative to it.
-   *
-   * @param {number} dp5  - ΔP5 in %
-   * @param {number} dp15 - ΔP15 in %
-   * @param {number} dp60 - ΔP60 in %
-   * @param {'long'|'short'} side
-   * @returns {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'NO_FOLLOW_THROUGH'}
-   */
-  _classify(dp5, dp15, dp60, side) {
-    const strong = config.REACTION_DP5_STRONG;
-    const cont15 = config.REACTION_DP15_CONTINUATION;
-    const rev15 = config.REACTION_DP15_REVERSAL;
-    const cont60 = config.REACTION_DP60_CONTINUATION;
-    const rev60 = config.REACTION_DP60_REVERSAL;
-    const absorbMax = config.REACTION_ABSORPTION_MAX;
-
-    // Gate: was the initial 5s move strong enough in either direction?
-    if (Math.abs(dp5) < strong) {
-      return 'NO_FOLLOW_THROUGH';
-    }
-
-    // Favorable direction: SHORT → UP (+1), LONG → DOWN (−1)
-    const favDir = side === 'short' ? 1 : -1;
-
-    // dp15 and dp60 projected onto favorable direction
-    const p15 = dp15 * favDir;
-    const p60 = dp60 * favDir;
-
-    // Is price continuing in the favorable direction?
-    const dp15Continues = p15 >= cont15 && p15 >= 0;
-    const dp60Continues = p60 >= cont60 && p60 >= 0;
-
-    // Is price reversing (going opposite to favorable direction)?
-    const dp15Reverses = p15 <= rev15 && p15 <= 0;
-    const dp60Reverses = p60 <= rev60 && p60 <= 0;
-
-    // Is price flat after initial impulse?
-    const dp15Flat = Math.abs(dp15) < absorbMax;
-    const dp60Flat = Math.abs(dp60) < absorbMax;
-
-    if (dp15Continues && dp60Continues) {
-      return 'STRONG_CONTINUATION';
-    }
-
-    if (dp15Reverses && dp60Reverses) {
-      return 'REVERSAL';
-    }
-
-    if (dp15Flat && dp60Flat) {
-      return 'ABSORPTION';
-    }
-
-    return 'NO_FOLLOW_THROUGH';
-  }
-
-  /**
-   * Analyze whether the market structurally accepted the new price zone
-   * after the liquidation impulse.
-   *
-   * Gated by MIN_IMPULSE_FOR_STRUCTURE — tiny moves skip structure analysis.
-   *
-   * @param {'long'|'short'} side
-   * @param {number|null} position30m - Position in 30m range (0..1)
-   * @param {number} retentionRatio - Clamped 0..1
-   * @param {boolean} lowData30m - Whether 30m coverage is below threshold
-   * @param {number} maxMove - Maximum favorable impulse magnitude (positive %)
-   * @returns {{ structureState: string, structureScoreAdjustment: number, structureLabels: string[] }}
-   */
-  _analyzeStructureAcceptance(side, position30m, retentionRatio, lowData30m, maxMove) {
-    // No context data available
-    if (position30m === null) {
-      return { structureState: 'no_context', structureScoreAdjustment: 0, structureLabels: [] };
-    }
-
-    // Impulse too small for meaningful structure analysis
-    if (Math.abs(maxMove) < config.MIN_IMPULSE_FOR_STRUCTURE) {
-      return { structureState: 'insufficient_impulse', structureScoreAdjustment: 0, structureLabels: [] };
-    }
-
-    /** @type {string} */
-    let structureState;
-    /** @type {number} */
-    let structureScoreAdjustment;
-    /** @type {string[]} */
-    let structureLabels;
-
-    if (side === 'short') {
-      // SHORT liquidation → bullish squeeze → look for acceptance near highs
-      if (position30m >= 0.8 && retentionRatio >= 0.7) {
-        structureState = 'breakout_accepted';
-        structureScoreAdjustment = +1;
-        structureLabels = [
-          '→ breakout accepted',
-          '→ price holding near range highs',
-          '→ bullish continuation more likely',
-        ];
-      } else if (position30m >= 0.4) {
-        structureState = 'partial_acceptance';
-        structureScoreAdjustment = 0;
-        structureLabels = [
-          '→ partial breakout',
-          '→ mixed continuation quality',
-        ];
-      } else {
-        structureState = 'failed_breakout';
-        structureScoreAdjustment = -1;
-        structureLabels = [
-          '→ breakout failed',
-          '→ price returned into prior range',
-          '→ squeeze probably rejected',
-        ];
-      }
-    } else {
-      // LONG liquidation → bearish cascade → look for acceptance near lows
-      if (position30m <= 0.2 && retentionRatio >= 0.7) {
-        structureState = 'breakdown_accepted';
-        structureScoreAdjustment = +1;
-        structureLabels = [
-          '→ breakdown accepted',
-          '→ price holding near range lows',
-          '→ bearish continuation more likely',
-        ];
-      } else if (position30m <= 0.6) {
-        structureState = 'partial_acceptance';
-        structureScoreAdjustment = 0;
-        structureLabels = [
-          '→ partial breakdown',
-          '→ mixed continuation quality',
-        ];
-      } else {
-        structureState = 'failed_breakdown';
-        structureScoreAdjustment = -1;
-        structureLabels = [
-          '→ breakdown failed',
-          '→ price recovered back into range',
-          '→ cascade probably rejected',
-        ];
-      }
-    }
-
-    if (lowData30m) {
-      structureLabels.push(' ⚠ low context reliability');
-    }
-
-    return { structureState, structureScoreAdjustment, structureLabels };
-  }
-
-  /**
-   * Build human-readable impulse retention interpretation.
-   * @param {number} finalMove - Net % move from p0 to p60
-   * @param {number} maxMove - Maximum favorable impulse magnitude (positive %)
-   * @param {number} retentionRatio - Clamped 0..1 ratio
-   * @param {'long'|'short'} side
-   * @returns {string[]}
-   */
-  _buildRetentionLabel(finalMove, maxMove, retentionRatio, side) {
-    // FULL REVERSAL — price went opposite direction of max impulse
-    if (side === 'short' && finalMove < 0) {
-      return ['→ market fully rejected move', '→ high reversal probability'];
-    }
-    if (side === 'long' && finalMove > 0) {
-      return ['→ market fully rejected move', '→ high reversal probability'];
-    }
-
-    // Normal retention interpretation
-    if (retentionRatio >= 0.7) {
-      return ['→ market accepted impulse', '→ continuation more likely'];
-    }
-    if (retentionRatio >= 0.3) {
-      return ['→ impulse weakening', '→ mixed continuation'];
-    }
-    return ['→ impulse mostly rejected', '→ likely liquidity sweep'];
-  }
-
-  /**
-   * Build multi-timeframe context interpretation label.
-   *
-   * CASE 1 — Alignment: both TFs near same extreme → "Strong resistance/support"
-   * CASE 2 — Local only: 5m extreme, 30m mid-range → "Local high/low, no HTF"
-   * CASE 3 — Conflict: one near high, other near low → "Range expansion / conflicting"
-   *
-   * @param {number} pos5  - Position in 5m range (0..1)
-   * @param {number} pos30 - Position in 30m range (0..1)
-   * @param {boolean} lowData5  - 5m coverage < threshold
-   * @param {boolean} lowData30 - 30m coverage < threshold
-   * @returns {string}
-   */
-  _buildContextLabel(pos5, pos30, lowData5, lowData30) {
-    const nearHigh5 = pos5 > 0.8;
-    const nearLow5 = pos5 < 0.2;
-    const nearHigh30 = pos30 > 0.8;
-    const nearLow30 = pos30 < 0.2;
-
-    let label = '';
-
-    // CASE 1: Alignment — strong multi-TF context
-    if (nearHigh5 && nearHigh30) {
-      label = '→ Strong resistance (multi-timeframe)';
-    } else if (nearLow5 && nearLow30) {
-      label = '→ Strong support (multi-timeframe)';
-
-    // CASE 2: Local extreme only (5m extreme, 30m mid-range)
-    } else if (nearHigh5 && pos30 >= 0.3 && pos30 <= 0.7) {
-      label = '→ Local high (5m), no HTF resistance';
-    } else if (nearLow5 && pos30 >= 0.3 && pos30 <= 0.7) {
-      label = '→ Local low (5m), no HTF support';
-
-    // CASE 3: Conflict — divergent extremes
-    } else if ((nearHigh5 && nearLow30) || (nearLow5 && nearHigh30)) {
-      label = '→ Range expansion / conflicting signals';
-
-    // Partial: single-TF near extreme
-    } else if (nearHigh5) {
-      label = '→ Near resistance (5m)';
-    } else if (nearLow5) {
-      label = '→ Near support (5m)';
-    } else if (nearHigh30) {
-      label = '→ Near resistance (30m)';
-    } else if (nearLow30) {
-      label = '→ Near support (30m)';
-    }
-
-    // Low data warning
-    if (lowData5 || lowData30) {
-      label += ' | ⚠ low context reliability';
-    }
-
-    return label;
-  }
-
-  /**
-   * Build human-readable type label for a reaction.
-   * side='short' — shorts liquidated → price squeezes UP
-   * side='long'  — longs liquidated → price cascades DOWN
-   * @param {'long'|'short'} side — the liquidated side
-   * @returns {string}
-   */
   _typeLabel(side) {
     return side === 'short' ? 'SHORT SQUEEZE 🟢' : 'LONG LIQUIDATION CASCADE 🔴';
   }
@@ -598,8 +377,15 @@ class SignalReactionTracker {
   formatReaction(reaction) {
     const typeLabel = this._typeLabel(reaction.side);
     const mergeNote = reaction.merged ? ` (merged x${reaction.mergeCount})` : '';
+    const pq = reaction.pathQuality;
 
-    // Market context lines
+    // Temporal OI breakdown
+    const oiLines = ['ΔOI:'];
+    if (typeof reaction.dOI5 === 'number') oiLines.push(`• 5s:  ${this._fmtPct(reaction.dOI5)}`);
+    if (typeof reaction.dOI15 === 'number') oiLines.push(`• 15s: ${this._fmtPct(reaction.dOI15)}`);
+    if (typeof reaction.dOI60 === 'number') oiLines.push(`• 60s: ${this._fmtPct(reaction.dOI60)}`);
+
+    // Position context (secondary)
     const contextLines = [];
     if (reaction.position_5m !== null) {
       contextLines.push('');
@@ -608,37 +394,14 @@ class SignalReactionTracker {
     if (reaction.position_30m !== null) {
       contextLines.push(`Position 30m: ${reaction.position_30m.toFixed(2)}`);
     }
-    if (reaction.contextLabel) {
-      contextLines.push(reaction.contextLabel);
-    }
 
-    // Classification human-readable block
-    const classificationBlock = this._classificationBlock(reaction.classification);
+    // Path Quality section
+    const pathBlock = this._buildPathQualityBlock(pq);
 
-    // Unified Market Acceptance block (retention + structure merged)
-    const marketAcceptanceBlock = this._buildMarketAcceptanceBlock(reaction);
-
-    // Confidence line
+    // Confidence
     const confidenceLine = reaction.confidenceScore !== undefined
       ? `\nConfidence: ${reaction.confidenceScore}/10 (${reaction.confidenceLabel})`
       : '';
-
-    // Retention impact line
-    const retentionImpactLine = reaction.retentionAdjustment !== undefined && reaction.retentionAdjustment !== 0
-      ? `Retention impact: ${reaction.retentionAdjustment >= 0 ? '+' : ''}${reaction.retentionAdjustment} (${reaction.retentionAdjustment > 0 ? 'market accepted impulse' : reaction.retentionAdjustment === -2 ? 'full rejection detected' : 'impulse weakened'})`
-      : '';
-
-    // Temporal OI breakdown
-    const oiLines = ['ΔOI:'];
-    if (typeof reaction.dOI5 === 'number') {
-      oiLines.push(`• 5s:  ${this._fmtPct(reaction.dOI5)}`);
-    }
-    if (typeof reaction.dOI15 === 'number') {
-      oiLines.push(`• 15s: ${this._fmtPct(reaction.dOI15)}`);
-    }
-    if (typeof reaction.dOI60 === 'number') {
-      oiLines.push(`• 60s: ${this._fmtPct(reaction.dOI60)}`);
-    }
 
     return [
       `📊 ${reaction.symbol} ${typeLabel} (${reaction.ratio.toFixed(1)}x)${mergeNote}`,
@@ -648,159 +411,99 @@ class SignalReactionTracker {
       `Δ60s: ${this._fmtPct(reaction.dp60)}`,
       ...oiLines,
       ...contextLines,
-      ...marketAcceptanceBlock,
-      ``,
-      ...classificationBlock,
+      ...pathBlock,
       confidenceLine,
-      retentionImpactLine,
     ].filter(Boolean).join('\n');
   }
 
   /**
-   * Build unified Market Acceptance block (retention + structure, trader-readable).
-   * Hierarchical: weak reactions get a minimal block, meaningful moves get full analysis.
-   * @param {ReactionResult} reaction
+   * Build the Path Quality display block.
+   * Template varies by path label.
+   * @param {PathQuality} pq
    * @returns {string[]}
    */
-  _buildMarketAcceptanceBlock(reaction) {
-    if (reaction.maxMove === undefined) return [];
+  _buildPathQualityBlock(pq) {
+    if (!pq) return [];
 
-    // ── WEAK reaction: no metrics, minimal interpretation ──
-    if (reaction.meaningfulImpulse === false) {
-      return [
-        '',
-        '📉 Weak Market Reaction',
-        '',
-        ...reaction.retentionLabel,
-      ];
+    const lines = ['', '📐 Path Quality'];
+
+    // Core metrics line
+    const mfeLine = `- MFE ${this._fmtPct(pq.mfe)} in ${pq.timeToMFE.toFixed(0)}s | MAE ${this._fmtPct(pq.mae)}`;
+    lines.push(mfeLine);
+
+    // Retention
+    if (pq.retention !== null) {
+      const retPct = Math.round(pq.retention * 100);
+      const retNote = pq.retention < 0.3 ? ' (faded)' : '';
+      lines.push(`- Retention: ${retPct}%${retNote}`);
     }
 
-    // ── MEANINGFUL reaction: hierarchical display ─────────
-    const hasStructure =
-      reaction.structureState &&
-      reaction.structureState !== 'insufficient_impulse' &&
-      reaction.structureState !== 'no_context' &&
-      reaction.position_30m !== null;
+    // Efficiency
+    const effDesc = pq.efficiency > 0.7 ? ' (clean path)' : pq.efficiency < 0 ? ' (reversal)' : '';
+    lines.push(`- Efficiency: ${pq.efficiency.toFixed(2)}${effDesc}`);
 
-    // Pick title and body based on structure outcome
-    let title, bodyLines;
+    // Final move
+    lines.push(`- Final: ${this._fmtPct(pq.finalMove)}`);
 
-    if (hasStructure) {
-      const isAccepted = reaction.structureState === 'breakout_accepted' || reaction.structureState === 'breakdown_accepted';
-      const isFailed = reaction.structureState === 'failed_breakout' || reaction.structureState === 'failed_breakdown';
+    // Interpretation line
+    lines.push('');
+    lines.push(...this._pathInterpretationLines(pq));
 
-      if (isAccepted) {
-        title = '📈 Market Acceptance';
-      } else if (isFailed) {
-        title = reaction.structureState === 'failed_breakout' ? '📉 Failed Breakout' : '📉 Failed Breakdown';
-      } else {
-        title = '📊 Partial Acceptance';
-      }
-
-      bodyLines = [
-        '',
-        `• Impulse retained: ${reaction.retentionPct}%`,
-        '',
-        ...reaction.structureLabels,
-      ];
-    } else {
-      // No structure context available — retention-only
-      title = '📈 Market Acceptance';
-      bodyLines = [
-        '',
-        `• Impulse retained: ${reaction.retentionPct}%`,
-        '',
-        ...reaction.retentionLabel,
-      ];
-    }
-
-    return ['', title, ...bodyLines];
+    return lines;
   }
 
   /**
-   * Format a percentage value with sign.
-   * @param {number} value
-   * @returns {string}
+   * Human-readable interpretation lines based on path label.
+   * @param {PathQuality} pq
+   * @returns {string[]}
    */
+  _pathInterpretationLines(pq) {
+    switch (pq.label) {
+      case 'clean_continuation':
+        return ['→ CLEAN CONTINUATION', '→ momentum sustained through observation window'];
+      case 'building_continuation':
+        return ['→ BUILDING CONTINUATION', '→ still developing at end of window', '→ momentum may extend further'];
+      case 'partial_continuation':
+        return ['→ PARTIAL CONTINUATION', '→ some resistance encountered', '→ moderate directional quality'];
+      case 'weak_continuation':
+        return ['→ WEAK CONTINUATION', '→ low directional conviction'];
+      case 'liquidity_sweep':
+        return ['⚠️ LIQUIDITY SWEEP', '→ fast spike, complete fade', '→ high reversal risk'];
+      case 'failed_move':
+        return ['→ FAILED MOVE', '→ market rejected the direction', '→ high reversal probability'];
+      case 'whipsaw':
+        return ['⚠️ WHIPSAW', '→ significant two-way movement', '→ no conviction'];
+      case 'dead_reaction':
+        return ['→ DEAD REACTION', '→ no meaningful displacement', '→ market ignored the liquidation'];
+      case 'absorbed':
+        return ['→ ABSORBED', '→ event was absorbed without moving price'];
+      default:
+        return [`→ ${pq.label.replace(/_/g, ' ').toUpperCase()}`];
+    }
+  }
+
   _fmtPct(value) {
     const sign = value >= 0 ? '+' : '';
     return `${sign}${value.toFixed(2)}%`;
   }
 
-  /**
-   * Build human-readable classification block (3 lines).
-   * @param {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'NO_FOLLOW_THROUGH'} classification
-   * @returns {string[]}
-   */
-  _classificationBlock(classification) {
-    switch (classification) {
-      case 'STRONG_CONTINUATION':
-        return [
-          '→ STRONG CONTINUATION',
-          '→ market continued liquidation direction',
-          '→ momentum remains strong',
-        ];
-      case 'REVERSAL':
-        return [
-          '→ REVERSAL',
-          '→ market rejected liquidation direction',
-          '→ reversal pressure detected',
-        ];
-      case 'ABSORPTION':
-        return [
-          '→ ABSORPTION',
-          '→ liquidation was absorbed by market',
-          '→ low directional follow-through',
-        ];
-      default:
-        return [
-          '→ NO FOLLOW-THROUGH',
-          '→ liquidation had weak market impact',
-          '→ momentum faded quickly',
-        ];
-    }
-  }
-
-  /**
-   * Remove a signal and clear its timers.
-   * @param {SignalState} state
-   */
   _removeSignal(state) {
     const sideMap = this.activeSignals.get(state.symbol);
     if (!sideMap) return;
-
     const signals = sideMap.get(state.side);
     if (!signals) return;
-
     const idx = signals.indexOf(state);
-    if (idx !== -1) {
-      signals.splice(idx, 1);
-    }
-
+    if (idx !== -1) signals.splice(idx, 1);
     this._clearTimers(state);
-
-    // Clean up empty buckets
-    if (signals.length === 0) {
-      sideMap.delete(state.side);
-    }
-    if (sideMap.size === 0) {
-      this.activeSignals.delete(state.symbol);
-    }
+    if (signals.length === 0) sideMap.delete(state.side);
+    if (sideMap.size === 0) this.activeSignals.delete(state.symbol);
   }
 
-  /**
-   * Cleanup: remove signal after 90s.
-   * @param {SignalState} state
-   */
   _cleanup(state) {
     logger.debug(`Reaction: cleanup ${state.id}`);
     this._removeSignal(state);
   }
 
-  /**
-   * Clear all pending timers for a signal state.
-   * @param {SignalState} state
-   */
   _clearTimers(state) {
     for (const key of Object.keys(state.timers)) {
       if (state.timers[key]) {
@@ -810,17 +513,10 @@ class SignalReactionTracker {
     }
   }
 
-  /**
-   * Register a callback for reaction results.
-   * @param {(reaction: ReactionResult) => void} callback
-   */
   onReaction(callback) {
     this.reactionCallbacks.push(callback);
   }
 
-  /**
-   * Graceful shutdown: clear all pending timers and state.
-   */
   stop() {
     for (const sideMap of this.activeSignals.values()) {
       for (const signals of sideMap.values()) {
@@ -834,10 +530,6 @@ class SignalReactionTracker {
     logger.info('Reaction tracker stopped');
   }
 
-  /**
-   * Get count of currently tracked signals.
-   * @returns {number}
-   */
   getTrackedSignalCount() {
     let count = 0;
     for (const sideMap of this.activeSignals.values()) {
@@ -869,9 +561,25 @@ class SignalReactionTracker {
  * @property {number|null} oi_15s
  * @property {number|null} oi_60s
  * @property {number|null} extremePriceSeen
+ * @property {number|null} adverseExtreme
+ * @property {number} timeOfMFE
  * @property {{ t5: NodeJS.Timeout|null, t15: NodeJS.Timeout|null, t60: NodeJS.Timeout|null, cleanup: NodeJS.Timeout|null }} timers
  * @property {boolean} merged
  * @property {number} mergeCount
+ */
+
+/**
+ * @typedef {object} PathQuality
+ * @property {number} mfe
+ * @property {number} mae
+ * @property {number} finalMove
+ * @property {number} timeToMFE
+ * @property {number|null} retention
+ * @property {number} efficiency
+ * @property {boolean} isSweep
+ * @property {'no_impulse'|'early_peak'|'mid_peak'|'late_peak'} momentumPhase
+ * @property {boolean} hasMeaningfulImpulse
+ * @property {string} label
  */
 
 /**
@@ -888,28 +596,15 @@ class SignalReactionTracker {
  * @property {number} dOI5
  * @property {number} dOI15
  * @property {number} dOI60
- * @property {string} oiLabel
- * @property {'STRONG_CONTINUATION'|'REVERSAL'|'ABSORPTION'|'NO_FOLLOW_THROUGH'} classification
  * @property {boolean} merged
  * @property {number} mergeCount
  * @property {number|null} position_5m
  * @property {number|null} position_30m
  * @property {boolean} lowData5m
  * @property {boolean} lowData30m
- * @property {string} contextLabel
- * @property {number} maxMove
- * @property {number} finalMove
- * @property {number} retentionRatio
- * @property {number} retentionPct
- * @property {string[]} retentionLabel
- * @property {boolean} meaningfulImpulse
+ * @property {PathQuality} pathQuality
  * @property {number} [confidenceScore]
  * @property {string} [confidenceLabel]
- * @property {number} [retentionAdjustment]
- * @property {string} structureState
- * @property {string[]} structureLabels
- * @property {number} structureScoreAdjustment
- * @property {number} [structureAdjustment]
  */
 
 // Singleton

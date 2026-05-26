@@ -3,14 +3,18 @@ import { getThresholdConfig } from '../config/index.js';
 /**
  * Signal Confidence Scorer
  *
- * Pure function — evaluates the strength of a liquidation signal
- * using ratio, price reaction, OI delta, and market context.
+ * Evaluates the strength of a liquidation signal using:
+ *   - Liquidation abnormality (ratio)
+ *   - Path quality (MFE, MAE, efficiency, retention, momentum phase)
+ *   - OI participation (side-aware)
+ *   - Multi-TF context
+ *   - Penalties
  *
  * Returns a normalized score 0–10 (one decimal) with a classification label.
  */
 
-/** Theoretical maximum raw score (additive sections only, before penalties) */
-const RAW_THEORETICAL_MAX = 14;
+/** Theoretical maximum raw score (additive sections only) */
+const RAW_THEORETICAL_MAX = 2 + 6.5 + 2 + 1; // A + B + C + D = 11.5
 
 /** Score labels by range */
 const LABELS = {
@@ -20,11 +24,6 @@ const LABELS = {
   EXTREME: 'EXTREME',
 };
 
-/**
- * Classify score into a human-readable label.
- * @param {number} score
- * @returns {string}
- */
 function classify(score) {
   if (score >= 9) return LABELS.EXTREME;
   if (score >= 7) return LABELS.STRONG;
@@ -33,61 +32,130 @@ function classify(score) {
 }
 
 /**
+ * Score path quality from geometry metrics.
+ * Replaces old Section B (price reaction) + acceptance + retention.
+ *
+ * @param {import('./signalReactionTracker.js').PathQuality} pq
+ * @returns {{ score: number, breakdown: object }}
+ */
+function scorePathQuality(pq) {
+  let score = 0;
+  const breakdown = {};
+
+  const { mfe, mae, retention, efficiency, isSweep, momentumPhase, hasMeaningfulImpulse } = pq;
+
+  // --- No meaningful impulse: penalty ---
+  if (!hasMeaningfulImpulse) {
+    score -= 1;
+    breakdown.noImpulse = -1;
+    return { score, breakdown };
+  }
+
+  // --- MFE magnitude (one bounded contribution, not triple-counted via deltas) ---
+  // TODO: replace with ATR-normalized thresholds per symbol
+  let mfeScore = 0;
+  if (mfe >= 1.0) mfeScore = 2;
+  else if (mfe >= 0.5) mfeScore = 1;
+  else if (mfe >= 0.3) mfeScore = 0.5;
+  score += mfeScore;
+  breakdown.mfe = mfeScore;
+
+  // --- Efficiency: how clean was the path ---
+  let effScore = 0;
+  if (efficiency > 0.7) effScore = 2;
+  else if (efficiency > 0.4) effScore = 1;
+  else if (efficiency < -0.3) effScore = -2;  // strong reversal
+  else if (efficiency < 0) effScore = -1;     // mild reversal
+  score += effScore;
+  breakdown.efficiency = effScore;
+
+  // --- Retention: did the move hold ---
+  let retScore = 0;
+  if (retention !== null) {
+    if (retention > 0.7) retScore = 1.5;
+    else if (retention > 0.4) retScore = 0.5;
+    else if (retention < 0) retScore = -1;   // ended against direction
+  }
+  score += retScore;
+  breakdown.retention = retScore;
+
+  // --- Momentum phase: late peak is bullish for continuation ---
+  let phaseScore = 0;
+  if (momentumPhase === 'late_peak') phaseScore = 1;       // still building
+  else if (momentumPhase === 'early_peak') phaseScore = -0.5;  // exhausted early
+  score += phaseScore;
+  breakdown.phase = phaseScore;
+
+  // --- Sweep penalty (classic liquidity grab) ---
+  if (isSweep) {
+    score -= 2;
+    breakdown.sweep = -2;
+  }
+
+  // --- Whipsaw penalty (no conviction) ---
+  if (mae > mfe * 0.6 && retention !== null && retention < 0.4) {
+    score -= 1;
+    breakdown.whipsaw = -1;
+  }
+
+  return { score, breakdown };
+}
+
+/**
+ * Score OI delta with side-aware interpretation.
+ *
+ * SHORT liquidation (price went UP):
+ *   dOI > 0 = new LONGS entering (bullish continuation confirmation)
+ *   dOI < 0 = shorts just closing, no new longs (weak basis)
+ *
+ * LONG liquidation (price went DOWN):
+ *   dOI > 0 = new SHORTS entering (bearish continuation confirmation)
+ *   dOI < 0 = longs just capitulating, no new shorts (possible bounce)
+ *
+ * @param {number} dOI - OI delta in %
+ * @param {'long'|'short'} side
+ * @returns {number}
+ */
+function scoreOI(dOI, side) {
+  // Both sides: positive dOI means new positions entering → confirms continuation
+  if (dOI > 2) return 2;
+  if (dOI > 1) return 1;
+  // Negative dOI: positions closing → exhaustion / flush complete
+  if (dOI < -2) return -1;
+  return 0;
+}
+
+/**
  * Score a reaction result.
  *
  * @param {import('./signalReactionTracker.js').ReactionResult} reaction
- * @returns {{ score: number, label: string, retentionAdjustment: number, structureAdjustment: number }}
+ * @returns {{ score: number, label: string }}
  */
 export function scoreReaction(reaction) {
   let score = 0;
 
-  const {
-    ratio, dp5, dp15, dp60, dOI,
-    position_5m, position_30m, lowData5m, lowData30m,
-    classification, retentionRatio, finalMove, side,
-  } = reaction;
+  const { ratio, dOI, side, position_5m, position_30m, lowData5m, lowData30m, pathQuality } = reaction;
 
   // ── A. Liquidation strength (ratio) ────────────────────
+  // Ratio is a necessary condition, not the main signal — reduced weight
   if (ratio >= 12) {
-    score += 4;
+    score += 2;
   } else if (ratio >= 8) {
-    score += 3;
+    score += 1.5;
   } else if (ratio >= 5) {
-    score += 2;
+    score += 1;
   } else if (ratio >= 3) {
-    score += 1;
+    score += 0.5;
   }
 
-  // ── B. Price reaction ──────────────────────────────────
-  // Favorable direction multiplier: SHORT → +1 (bullish), LONG → −1 (bearish)
-  const favDir = side === 'short' ? 1 : -1;
-  // Projected deltas onto favorable direction (positive = moving favorably)
-  const dp5f = dp5 * favDir;
-  const dp15f = dp15 * favDir;
-  const dp60f = dp60 * favDir;
+  // ── B. Path quality (replaces old B + acceptance + retention) ──
+  const pqResult = scorePathQuality(pathQuality);
+  score += pqResult.score;
 
-  if (classification === 'STRONG_CONTINUATION' || classification === 'ABSORPTION') {
-    if (dp5f >= 0.25) score += 1;
-    if (dp15f >= 0.15) score += 1;
-    if (dp60f >= 0.3) score += 1;
-  }
+  // ── C. OI delta (side-aware) ───────────────────────────
+  score += scoreOI(dOI, side);
 
-  if (classification === 'REVERSAL') {
-    // Reversal means price went opposite to favorable direction
-    if (dp15f <= -0.15) score += 1;
-    if (dp60f <= -0.2) score += 1;
-  }
-
-  // ── C. Open Interest ───────────────────────────────────
-  if (dOI > 2) {
-    score += 2;
-  } else if (dOI > 1) {
-    score += 1;
-  } else if (dOI < -2) {
-    score -= 1;
-  }
-
-  // ── D. Market context (multi-timeframe) ────────────────
+  // ── D. Multi-TF context (reduced weight) ────────────────
   let isHigh5m = false;
   let isLow5m = false;
   let isHigh30m = false;
@@ -102,56 +170,21 @@ export function scoreReaction(reaction) {
     isLow30m = position_30m < 0.2;
   }
 
-  // Alignment: both TFs at same extreme → high conviction
   if ((isHigh5m && isHigh30m) || (isLow5m && isLow30m)) {
-    score += 2;
+    score += 1;
   }
-
-  // Conflict: divergent extremes → lower conviction
   if ((isHigh5m && isLow30m) || (isLow5m && isHigh30m)) {
     score -= 1;
   }
 
   // ── E. Penalties ───────────────────────────────────────
-  // Low data coverage
   if (lowData5m || lowData30m) {
     score -= 1;
   }
 
-  // Absolute size penalty: L_now barely above absThreshold * 2
   const { absThreshold } = getThresholdConfig(reaction.symbol);
   if (typeof reaction.L_now === 'number' && reaction.L_now < absThreshold * 2) {
     score -= 1;
-  }
-
-  // ── F. Impulse retention adjustment ────────────────────
-  let retentionAdjustment = 0;
-
-  // Only score retention when the impulse was meaningful
-  if (reaction.meaningfulImpulse !== false && typeof retentionRatio === 'number' && typeof finalMove === 'number') {
-    // Full reversal — price went opposite direction of max impulse
-    if ((side === 'short' && finalMove < 0) || (side === 'long' && finalMove > 0)) {
-      retentionAdjustment = -2;
-    } else if (retentionRatio >= 0.7) {
-      retentionAdjustment = +2;
-    } else if (retentionRatio >= 0.3) {
-      retentionAdjustment = 0;
-    } else {
-      retentionAdjustment = -1;
-    }
-  }
-
-  score += retentionAdjustment;
-
-  // ── G. Market structure acceptance adjustment ──────────
-  const structureAdjustment = typeof reaction.structureScoreAdjustment === 'number'
-    ? reaction.structureScoreAdjustment
-    : 0;
-  score += structureAdjustment;
-
-  // ── Hard cap for weak impulses ─────────────────────────
-  if (reaction.meaningfulImpulse === false) {
-    score = Math.min(score, 4);
   }
 
   // ── Normalize & classify ───────────────────────────────
@@ -160,7 +193,7 @@ export function scoreReaction(reaction) {
   const finalScore = Math.max(0, Math.min(10, roundedScore));
   const label = classify(finalScore);
 
-  return { score: finalScore, label, retentionAdjustment, structureAdjustment };
+  return { score: finalScore, label };
 }
 
 export { LABELS, classify };
