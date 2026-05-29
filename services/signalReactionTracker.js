@@ -171,7 +171,10 @@ class SignalReactionTracker {
   }
 
   async _initTracking(state) {
-    const snap = priceStreamService.getClosestSnapshot(state.symbol, Date.now());
+    // Snap price_0 to the alert timestamp, not Date.now(). This removes the async gap
+    // between the alert firing and tracking init, and anchors the path geometry to a
+    // tradeable reference (you cannot act before the alert fires).
+    const snap = priceStreamService.getClosestSnapshot(state.symbol, state.startTime);
     if (!snap) {
       logger.error(`Reaction ${state.id}: no price data in buffer — aborting tracking`);
       this._removeSignal(state);
@@ -332,10 +335,24 @@ class SignalReactionTracker {
 
     const timeToMFE = state.timeOfMFE;
 
+    // ── Volatility normalization (σ ruler, measured pre-event) ──────
+    // σ of 1s log-returns over VOL_LOOKBACK_MS, ending just before the signal so the
+    // impulse itself does not inflate it. Scaled to the 60s observation horizon (√time)
+    // and expressed in % so MFE/MAE/finalMove become comparable across symbols.
+    const vol = priceStreamService.getReturnVolatility(
+      state.symbol, config.VOL_LOOKBACK_MS, state.startTime - 1_000
+    );
+    const sigma60 = vol ? vol.sigma1s * Math.sqrt(60) * 100 : null;
+
+    const mfe_sigma = sigma60 ? mfe / sigma60 : null;
+    const mae_sigma = sigma60 ? mae / sigma60 : null;
+    const finalMove_sigma = sigma60 ? finalMove / sigma60 : null;
+
     // ── Derived path quality indicators ────────────────────
-    // TODO: replace 0.3 with ATR-based threshold per symbol
-    const MIN_MEANINGFUL_MFE = 0.3;
-    const hasMeaningfulImpulse = mfe >= MIN_MEANINGFUL_MFE;
+    // σ-based meaningfulness gate when volatility is available; raw-% fallback otherwise.
+    const hasMeaningfulImpulse = mfe_sigma !== null
+      ? mfe_sigma >= config.MIN_MEANINGFUL_MFE_SIGMA
+      : mfe >= config.MIN_MEANINGFUL_MFE_PCT;
 
     const retention = hasMeaningfulImpulse
       ? Math.max(-1, Math.min(1, finalMove / mfe))
@@ -373,6 +390,10 @@ class SignalReactionTracker {
       mae,
       finalMove,
       timeToMFE,
+      sigma60,
+      mfe_sigma,
+      mae_sigma,
+      finalMove_sigma,
       retention,
       efficiency,
       isSweep,
@@ -590,7 +611,9 @@ class SignalReactionTracker {
 
     const lines = ['', '📐 Path Quality'];
 
-    const mfeLine = `- MFE ${this._fmtPct(pq.mfe)} in ${pq.timeToMFE.toFixed(0)}s | MAE ${this._fmtPct(pq.mae)}`;
+    const mfeSig = pq.mfe_sigma != null ? ` (${pq.mfe_sigma.toFixed(1)}σ)` : '';
+    const maeSig = pq.mae_sigma != null ? ` (${pq.mae_sigma.toFixed(1)}σ)` : '';
+    const mfeLine = `- MFE ${this._fmtPct(pq.mfe)}${mfeSig} in ${pq.timeToMFE.toFixed(0)}s | MAE ${this._fmtPct(pq.mae)}${maeSig}`;
     lines.push(mfeLine);
 
     if (pq.retention !== null) {
@@ -803,6 +826,10 @@ class SignalReactionTracker {
  * @property {number} mae
  * @property {number} finalMove
  * @property {number} timeToMFE
+ * @property {number|null} sigma60 - pre-event σ over the 60s horizon, in % (null if unavailable)
+ * @property {number|null} mfe_sigma - mfe in units of sigma60
+ * @property {number|null} mae_sigma - mae in units of sigma60
+ * @property {number|null} finalMove_sigma - finalMove in units of sigma60
  * @property {number|null} retention
  * @property {number} efficiency
  * @property {boolean} isSweep

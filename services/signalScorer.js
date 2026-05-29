@@ -51,7 +51,7 @@ function scorePathQuality(pq) {
   let score = 0;
   const breakdown = {};
 
-  const { mfe, mae, retention, efficiency, isSweep, momentumPhase, hasMeaningfulImpulse } = pq;
+  const { mfe, mae, mfe_sigma, retention, efficiency, isSweep, momentumPhase, hasMeaningfulImpulse } = pq;
 
   if (!hasMeaningfulImpulse) {
     score -= 1;
@@ -59,11 +59,17 @@ function scorePathQuality(pq) {
     return { score, breakdown };
   }
 
-  // MFE magnitude
+  // MFE magnitude — volatility-normalized (σ) when available, raw-% fallback otherwise.
   let mfeScore = 0;
-  if (mfe >= 1.0) mfeScore = 2;
-  else if (mfe >= 0.5) mfeScore = 1;
-  else if (mfe >= 0.3) mfeScore = 0.5;
+  if (mfe_sigma != null) {
+    if (mfe_sigma >= 3) mfeScore = 2;
+    else if (mfe_sigma >= 2) mfeScore = 1;
+    else if (mfe_sigma >= 1) mfeScore = 0.5;
+  } else {
+    if (mfe >= 1.0) mfeScore = 2;
+    else if (mfe >= 0.5) mfeScore = 1;
+    else if (mfe >= 0.3) mfeScore = 0.5;
+  }
   score += mfeScore;
   breakdown.mfe = mfeScore;
 

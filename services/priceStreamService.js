@@ -321,9 +321,18 @@ class PriceStreamService {
    */
   _onTickerData(symbol, price, oi) {
     const now = Date.now();
+
+    // Notify listeners on EVERY tick (before the throttle gate below).
+    // Live MFE/MAE extreme tracking needs full tick resolution to catch sub-second
+    // wicks. This is cheap — it only does a few comparisons for currently tracked
+    // signals. Buffer writes stay throttled to 1 Hz (storage needs no sub-second).
+    for (const cb of this.priceCallbacks) {
+      try { cb(symbol, price); } catch { /* ignore */ }
+    }
+
     const last = this.lastWrite.get(symbol) || 0;
 
-    // Throttle: skip if written within PRICE_THROTTLE_MS
+    // Throttle: skip the BUFFER WRITE if written within PRICE_THROTTLE_MS
     if (now - last < config.PRICE_THROTTLE_MS) {
       return;
     }
@@ -342,11 +351,6 @@ class PriceStreamService {
 
     // Clean old entries: while+shift — O(1) amortized
     this._cleanBuffer(symbol, now);
-
-    // Notify registered listeners of price update
-    for (const cb of this.priceCallbacks) {
-      try { cb(symbol, price); } catch { /* ignore */ }
-    }
   }
 
   /**
@@ -411,6 +415,66 @@ class PriceStreamService {
     const coverage = durationMs > 0 ? Math.min(actualSpan / durationMs, 1) : 1;
 
     return { high, low, coverage };
+  }
+
+  /**
+   * Realized per-second volatility (σ of log returns) over a window ending at `endTime`.
+   *
+   * Each return is normalized by its actual dt so the throttled (≥1s, occasionally gapped)
+   * sampling does not bias the estimate: variance contribution = r² / dt_seconds.
+   * Single for-loop — no .filter()/.map(). Buffer is chronologically ordered.
+   *
+   * @param {string} symbol
+   * @param {number} durationMs - lookback window length
+   * @param {number} endTime - window end (exclusive of later entries); measure pre-event
+   * @returns {{ sigma1s: number, samples: number, coverage: number } | null}
+   *   sigma1s is a fraction (e.g. 0.0004 = 0.04%/s). null if too few samples or σ ≤ 0.
+   */
+  getReturnVolatility(symbol, durationMs, endTime) {
+    const buffer = this.priceBuffer.get(symbol);
+    if (!buffer || buffer.length < 2) return null;
+
+    const startCutoff = endTime - durationMs;
+
+    let sumSqPerSec = 0;
+    let n = 0;
+    let prevPrice = 0;
+    let prevTime = 0;
+    let firstTime = 0;
+    let lastTime = 0;
+    let havePrev = false;
+
+    for (let i = 0, len = buffer.length; i < len; i++) {
+      const entry = buffer[i];
+      if (entry.time < startCutoff) continue;
+      if (entry.time > endTime) break;        // chronological — rest is past the window
+      if (entry.price <= 0) continue;
+
+      if (havePrev) {
+        const dtSec = (entry.time - prevTime) / 1000;
+        if (dtSec > 0) {
+          const r = Math.log(entry.price / prevPrice);
+          sumSqPerSec += (r * r) / dtSec;     // per-second variance contribution
+          n++;
+          lastTime = entry.time;
+        }
+      } else {
+        firstTime = entry.time;
+        lastTime = entry.time;
+      }
+
+      prevPrice = entry.price;
+      prevTime = entry.time;
+      havePrev = true;
+    }
+
+    if (n < (config.VOL_MIN_SAMPLES || 30)) return null;
+
+    const sigma1s = Math.sqrt(sumSqPerSec / n);
+    if (!isFinite(sigma1s) || sigma1s <= 0) return null;
+
+    const coverage = durationMs > 0 ? Math.min((lastTime - firstTime) / durationMs, 1) : 1;
+    return { sigma1s, samples: n, coverage };
   }
 
   /**

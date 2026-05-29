@@ -65,7 +65,15 @@ export default {
   CONTEXT_MID_RANGE_MS: parseInt(process.env.CONTEXT_MID_RANGE_MS, 10) || 1_800_000,
   CONTEXT_MIN_COVERAGE: parseFloat(process.env.CONTEXT_MIN_COVERAGE) || 0.5,
   MIN_IMPULSE_FOR_STRUCTURE: parseFloat(process.env.MIN_IMPULSE_FOR_STRUCTURE) || 0.3,
-  MIN_MEANINGFUL_IMPULSE: parseFloat(process.env.MIN_MEANINGFUL_IMPULSE) || 0.3,
+
+  // ── Volatility Normalization (σ ruler for path geometry) ──
+  // σ of 1s log-returns over VOL_LOOKBACK_MS, measured pre-event, scaled to the 60s horizon.
+  // Used to express MFE/MAE/finalMove in units of each symbol's own volatility.
+  VOL_LOOKBACK_MS: parseInt(process.env.VOL_LOOKBACK_MS, 10) || 900_000,
+  VOL_MIN_SAMPLES: parseInt(process.env.VOL_MIN_SAMPLES, 10) || 30,
+  // Meaningful-impulse gate: σ-based when volatility is available, raw-% fallback otherwise.
+  MIN_MEANINGFUL_MFE_SIGMA: parseFloat(process.env.MIN_MEANINGFUL_MFE_SIGMA) || 1.0,
+  MIN_MEANINGFUL_MFE_PCT: parseFloat(process.env.MIN_MEANINGFUL_MFE_PCT) || 0.3,
 
   // ── Windows & Timing ──────────────────────────────────
   BUFFER_DURATION_MS: parseInt(process.env.BUFFER_DURATION_MS, 10) || 20_000,
