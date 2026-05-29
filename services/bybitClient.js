@@ -8,17 +8,20 @@ class BybitClient {
   }
 
   /**
-   * Make an HTTP GET request to the Bybit API
+   * Make an HTTP GET request to the Bybit API with retry logic.
+   * Handles non-200 responses, timeouts, and transient failures.
+   *
    * @param {string} path - API path
    * @param {object} params - Query parameters
+   * @param {number} [retries=3] - Remaining retry attempts
    * @returns {Promise<object>} - Parsed JSON response
    */
-  _request(path, params = {}) {
+  _request(path, params = {}, retries = 3) {
     return new Promise((resolve, reject) => {
       const queryString = new URLSearchParams(params).toString();
       const url = `${this.baseUrl}${path}${queryString ? `?${queryString}` : ''}`;
 
-      https.get(url, (res) => {
+      const req = https.get(url, { timeout: 10_000 }, (res) => {
         let data = '';
 
         res.on('data', (chunk) => {
@@ -26,15 +29,62 @@ class BybitClient {
         });
 
         res.on('end', () => {
+          // Check HTTP status code before attempting JSON parse
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            const preview = data.substring(0, 200);
+            const err = new Error(`Bybit HTTP ${res.statusCode}: ${preview}`);
+            err.statusCode = res.statusCode;
+
+            // Retry on rate limit (429) or server errors (5xx)
+            if (retries > 0 && (res.statusCode === 429 || res.statusCode >= 500)) {
+              const delay = (4 - retries) * 1000;
+              logger.warn(`Bybit HTTP ${res.statusCode} on ${path}, retrying in ${delay}ms (${retries} left)`);
+              setTimeout(() => {
+                this._request(path, params, retries - 1).then(resolve).catch(reject);
+              }, delay);
+              return;
+            }
+
+            reject(err);
+            return;
+          }
+
+          // Parse JSON
           try {
             const parsed = JSON.parse(data);
             resolve(parsed);
           } catch (error) {
+            logger.error(`JSON parse failed for ${path}. Raw response: ${data.substring(0, 500)}`);
             reject(new Error(`Failed to parse response: ${error.message}`));
           }
         });
-      }).on('error', (error) => {
-        reject(new Error(`Request failed: ${error.message}`));
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        const err = new Error(`Request timeout: ${path}`);
+        if (retries > 0) {
+          const delay = (4 - retries) * 1000;
+          logger.warn(`Timeout on ${path}, retrying in ${delay}ms (${retries} left)`);
+          setTimeout(() => {
+            this._request(path, params, retries - 1).then(resolve).catch(reject);
+          }, delay);
+          return;
+        }
+        reject(err);
+      });
+
+      req.on('error', (error) => {
+        const err = new Error(`Request failed: ${error.message}`);
+        if (retries > 0) {
+          const delay = (4 - retries) * 1000;
+          logger.warn(`Request error on ${path}, retrying in ${delay}ms (${retries} left): ${error.message}`);
+          setTimeout(() => {
+            this._request(path, params, retries - 1).then(resolve).catch(reject);
+          }, delay);
+          return;
+        }
+        reject(err);
       });
     });
   }
