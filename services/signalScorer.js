@@ -6,6 +6,7 @@ import { getThresholdConfig } from '../config/index.js';
  * Evaluates the strength of a liquidation signal using:
  *   - Liquidation abnormality (ratio)
  *   - Path quality (MFE, MAE, efficiency, retention, momentum phase)
+ *   - Participation quality (CVD, aggressor shift, large traders, intensity)
  *   - OI participation (side-aware)
  *   - Multi-TF context
  *   - Penalties
@@ -13,8 +14,16 @@ import { getThresholdConfig } from '../config/index.js';
  * Returns a normalized score 0–10 (one decimal) with a classification label.
  */
 
-/** Theoretical maximum raw score (additive sections only) */
-const RAW_THEORETICAL_MAX = 2 + 6.5 + 2 + 1; // A + B + C + D = 11.5
+/**
+ * Theoretical maximum raw score (additive sections only):
+ *   A. Ratio:        0 to 2
+ *   B. Path quality: -3 to 6.5
+ *   C. Participation: -4.5 to 6
+ *   D. OI:           -1 to 2
+ *   E. Context:      -1 to 1
+ *   = 17.5 (penalties subtractive below)
+ */
+const RAW_THEORETICAL_MAX = 17.5;
 
 /** Score labels by range */
 const LABELS = {
@@ -44,15 +53,13 @@ function scorePathQuality(pq) {
 
   const { mfe, mae, retention, efficiency, isSweep, momentumPhase, hasMeaningfulImpulse } = pq;
 
-  // --- No meaningful impulse: penalty ---
   if (!hasMeaningfulImpulse) {
     score -= 1;
     breakdown.noImpulse = -1;
     return { score, breakdown };
   }
 
-  // --- MFE magnitude (one bounded contribution, not triple-counted via deltas) ---
-  // TODO: replace with ATR-normalized thresholds per symbol
+  // MFE magnitude
   let mfeScore = 0;
   if (mfe >= 1.0) mfeScore = 2;
   else if (mfe >= 0.5) mfeScore = 1;
@@ -60,42 +67,119 @@ function scorePathQuality(pq) {
   score += mfeScore;
   breakdown.mfe = mfeScore;
 
-  // --- Efficiency: how clean was the path ---
+  // Efficiency
   let effScore = 0;
   if (efficiency > 0.7) effScore = 2;
   else if (efficiency > 0.4) effScore = 1;
-  else if (efficiency < -0.3) effScore = -2;  // strong reversal
-  else if (efficiency < 0) effScore = -1;     // mild reversal
+  else if (efficiency < -0.3) effScore = -2;
+  else if (efficiency < 0) effScore = -1;
   score += effScore;
   breakdown.efficiency = effScore;
 
-  // --- Retention: did the move hold ---
+  // Retention
   let retScore = 0;
   if (retention !== null) {
     if (retention > 0.7) retScore = 1.5;
     else if (retention > 0.4) retScore = 0.5;
-    else if (retention < 0) retScore = -1;   // ended against direction
+    else if (retention < 0) retScore = -1;
   }
   score += retScore;
   breakdown.retention = retScore;
 
-  // --- Momentum phase: late peak is bullish for continuation ---
+  // Momentum phase
   let phaseScore = 0;
-  if (momentumPhase === 'late_peak') phaseScore = 1;       // still building
-  else if (momentumPhase === 'early_peak') phaseScore = -0.5;  // exhausted early
+  if (momentumPhase === 'late_peak') phaseScore = 1;
+  else if (momentumPhase === 'early_peak') phaseScore = -0.5;
   score += phaseScore;
   breakdown.phase = phaseScore;
 
-  // --- Sweep penalty (classic liquidity grab) ---
+  // Sweep penalty
   if (isSweep) {
     score -= 2;
     breakdown.sweep = -2;
   }
 
-  // --- Whipsaw penalty (no conviction) ---
+  // Whipsaw penalty
   if (mae > mfe * 0.6 && retention !== null && retention < 0.4) {
     score -= 1;
     breakdown.whipsaw = -1;
+  }
+
+  return { score, breakdown };
+}
+
+/**
+ * Score participation quality from trade flow (CVD) metrics.
+ * Independent dimension — measures voluntary trade flow around the liquidation.
+ *
+ * @param {import('./signalReactionTracker.js').ParticipationResult} p
+ * @returns {{ score: number, breakdown: object }}
+ */
+function scoreParticipation(p) {
+  let score = 0;
+  const breakdown = {};
+
+  const {
+    cvd15_aligned, cvd60_aligned, participationRatio,
+    aggBuyShift, largeParticipation, intensitySurge,
+    tradeCount_15s, label,
+  } = p;
+
+  // Insufficient data — neutral, do not score
+  if (label === 'insufficient_flow_data' || tradeCount_15s < 5) {
+    breakdown.note = 'insufficient_data';
+    return { score: 0, breakdown };
+  }
+
+  // Main signal: aligned CVD presence
+  if (label === 'strong_aligned_participation') {
+    score += 3;
+    breakdown.alignedFlow = 3;
+  } else if (label === 'passive_aligned') {
+    score += 1;
+    breakdown.alignedFlow = 1;
+  } else if (label === 'liquidity_vacuum') {
+    score -= 1.5;
+    breakdown.vacuum = -1.5;
+  } else if (label === 'absorption_against') {
+    score -= 2.5;
+    breakdown.absorption = -2.5;
+  }
+
+  // Bonus: aggressor balance shift confirms direction
+  if (aggBuyShift !== null) {
+    if (aggBuyShift > 0.15) {
+      score += 1;
+      breakdown.aggressorShift = 1;
+    } else if (aggBuyShift < -0.15) {
+      score -= 1;
+      breakdown.aggressorShift = -1;
+    }
+  }
+
+  // Bonus: large traders aligned (institutional confirmation)
+  if (largeParticipation > 0.2) {
+    score += 1;
+    breakdown.largeTraders = 1;
+  } else if (largeParticipation < -0.2) {
+    score -= 1;
+    breakdown.largeTraders = -1;
+  }
+
+  // Bonus: intensity surge (market woke up and engaged)
+  if (intensitySurge > 3 && cvd15_aligned > 0) {
+    score += 0.5;
+    breakdown.intensity = 0.5;
+  }
+
+  // Sanity: persistent flow (60s confirms 15s)
+  if (cvd60_aligned > 0 && cvd15_aligned > 0 && cvd60_aligned >= cvd15_aligned * 0.7) {
+    score += 0.5;
+    breakdown.persistence = 0.5;
+  } else if (cvd15_aligned > 0 && cvd60_aligned < 0) {
+    // Flow reversed within window — bad sign
+    score -= 1;
+    breakdown.flowReversal = -1;
   }
 
   return { score, breakdown };
@@ -117,10 +201,8 @@ function scorePathQuality(pq) {
  * @returns {number}
  */
 function scoreOI(dOI, side) {
-  // Both sides: positive dOI means new positions entering → confirms continuation
   if (dOI > 2) return 2;
   if (dOI > 1) return 1;
-  // Negative dOI: positions closing → exhaustion / flush complete
   if (dOI < -2) return -1;
   return 0;
 }
@@ -134,10 +216,9 @@ function scoreOI(dOI, side) {
 export function scoreReaction(reaction) {
   let score = 0;
 
-  const { ratio, dOI, side, position_5m, position_30m, lowData5m, lowData30m, pathQuality } = reaction;
+  const { ratio, dOI, side, position_5m, position_30m, lowData5m, lowData30m, pathQuality, participation } = reaction;
 
   // ── A. Liquidation strength (ratio) ────────────────────
-  // Ratio is a necessary condition, not the main signal — reduced weight
   if (ratio >= 12) {
     score += 2;
   } else if (ratio >= 8) {
@@ -148,14 +229,18 @@ export function scoreReaction(reaction) {
     score += 0.5;
   }
 
-  // ── B. Path quality (replaces old B + acceptance + retention) ──
-  const pqResult = scorePathQuality(pathQuality);
-  score += pqResult.score;
+  // ── B. Path quality ────────────────────────────────────
+  score += scorePathQuality(pathQuality).score;
 
-  // ── C. OI delta (side-aware) ───────────────────────────
+  // ── C. Participation quality (CVD/trade flow) ────────────
+  if (participation) {
+    score += scoreParticipation(participation).score;
+  }
+
+  // ── D. OI delta (side-aware) ───────────────────────────
   score += scoreOI(dOI, side);
 
-  // ── D. Multi-TF context (reduced weight) ────────────────
+  // ── E. Multi-TF context ────────────────────────────────
   let isHigh5m = false;
   let isLow5m = false;
   let isHigh30m = false;
@@ -177,7 +262,7 @@ export function scoreReaction(reaction) {
     score -= 1;
   }
 
-  // ── E. Penalties ───────────────────────────────────────
+  // ── F. Penalties ───────────────────────────────────────
   if (lowData5m || lowData30m) {
     score -= 1;
   }

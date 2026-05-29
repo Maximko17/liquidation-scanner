@@ -1,4 +1,5 @@
 import priceStreamService from './priceStreamService.js';
+import tradeStreamService from './tradeStreamService.js';
 import { scoreReaction } from './signalScorer.js';
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
@@ -10,9 +11,11 @@ import logger from '../utils/logger.js';
  *   1. Captures price_0 and oi_0 at signal time
  *   2. Schedules snapshots at +5s, +15s, +60s
  *   3. Tracks path geometry: favorable extreme, adverse extreme, time-to-MFE
- *   4. Computes path quality metrics: MFE, MAE, finalMove, retention, efficiency
- *   5. Derives a human-readable path label from geometry (not rigid rules)
- *   6. Sends a secondary alert with the path analysis
+ *   4. Captures trade flow (CVD) at 0/5/15/60s
+ *   5. Computes path quality metrics: MFE, MAE, finalMove, retention, efficiency
+ *   6. Computes participation metrics: CVD, aggressor shift, large trade involvement
+ *   7. Derives human-readable labels from geometry and flow (not rigid rules)
+ *   8. Sends a secondary alert with the combined analysis
  *
  * Merge logic for cascading signals:
  *   - If a new alert arrives within MERGE_WINDOW_MS (10s) of an active signal
@@ -24,17 +27,6 @@ import logger from '../utils/logger.js';
 /**
  * Derive a human-readable path label from geometry metrics.
  * This is for display only — scoring uses continuous metrics, not this label.
- *
- * @param {object} params
- * @param {number} params.mfe
- * @param {number} params.mae
- * @param {number} params.finalMove
- * @param {number|null} params.retention
- * @param {number} params.efficiency
- * @param {boolean} params.isSweep
- * @param {string} params.momentumPhase
- * @param {boolean} params.hasMeaningfulImpulse
- * @returns {string}
  */
 function derivePathLabel({ mfe, mae, finalMove, retention, efficiency, isSweep, momentumPhase, hasMeaningfulImpulse }) {
   if (!hasMeaningfulImpulse) {
@@ -55,6 +47,43 @@ function derivePathLabel({ mfe, mae, finalMove, retention, efficiency, isSweep, 
   if (mae > mfe * 0.6) return 'whipsaw';
 
   return 'weak_continuation';
+}
+
+/**
+ * Derive a participation label from trade flow metrics.
+ * Independent dimension from path quality.
+ */
+function deriveParticipationLabel({
+  cvd15_aligned, cvd60_aligned, participationRatio,
+  largeCvdAligned_15s, intensitySurge, flow_15s,
+}) {
+  const minTrades = config.MIN_TRADES_FOR_FLOW_ANALYSIS || 5;
+
+  if (!flow_15s || flow_15s.tradeCount < minTrades) {
+    return 'insufficient_flow_data';
+  }
+
+  // Strong aligned participation: aggressive flow in direction exceeds liquidation
+  if (participationRatio > 0.5 && cvd15_aligned > 0 && largeCvdAligned_15s > 0) {
+    return 'strong_aligned_participation';
+  }
+
+  // Aligned but passive — flow agrees but not dominant
+  if (cvd15_aligned > 0 && cvd60_aligned > 0 && participationRatio < 0.5) {
+    return 'passive_aligned';
+  }
+
+  // Liquidity vacuum — almost no aggressive flow either way
+  if (Math.abs(cvd15_aligned) < flow_15s.totalVolume * 0.1 && intensitySurge < 1.5) {
+    return 'liquidity_vacuum';
+  }
+
+  // Absorption / hidden seller — flow OPPOSITE to liquidation direction
+  if (cvd15_aligned < 0 && Math.abs(cvd15_aligned) > flow_15s.totalVolume * 0.2) {
+    return 'absorption_against';
+  }
+
+  return 'mixed_flow';
 }
 
 class SignalReactionTracker {
@@ -126,6 +155,10 @@ class SignalReactionTracker {
       extremePriceSeen: null,
       adverseExtreme: null,
       timeOfMFE: 0,
+      flowBaseline: null,
+      flow_5s: null,
+      flow_15s: null,
+      flow_60s: null,
       timers: { t5: null, t15: null, t60: null, cleanup: null },
       merged: false,
       mergeCount: 0,
@@ -150,6 +183,19 @@ class SignalReactionTracker {
     state.extremePriceSeen = snap.price;
     state.adverseExtreme = snap.price;
     logger.debug(`Reaction ${state.id}: price_0=${state.price_0}, oi_0=${state.oi_0}`);
+
+    // Pre-signal flow baseline — 60s before the signal
+    if (tradeStreamService) {
+      try {
+        const baselineWindow = config.FLOW_BASELINE_WINDOW_MS || 60_000;
+        state.flowBaseline = tradeStreamService.getFlowMetrics(
+          state.symbol, state.startTime - baselineWindow, state.startTime
+        );
+        logger.debug(`Reaction ${state.id}: flow baseline — ${state.flowBaseline.tradeCount} trades, CVD=${state.flowBaseline.cvd.toFixed(0)}`);
+      } catch (e) {
+        logger.warn(`Reaction ${state.id}: failed to capture flow baseline`, { error: e.message });
+      }
+    }
 
     state.timers.t5 = setTimeout(() => this._capture5s(state), 5_000);
     state.timers.t15 = setTimeout(() => this._capture15s(state), 15_000);
@@ -198,6 +244,16 @@ class SignalReactionTracker {
     state.price_5s = snap?.price ?? state.price_0;
     state.oi_5s = snap?.openInterest || state.oi_0;
     logger.debug(`Reaction ${state.id}: price_5s=${state.price_5s}, oi_5s=${state.oi_5s}`);
+
+    if (tradeStreamService) {
+      try {
+        state.flow_5s = tradeStreamService.getFlowMetrics(
+          state.symbol, state.startTime, state.startTime + 5_000
+        );
+      } catch (e) {
+        logger.warn(`Reaction ${state.id}: failed to capture flow_5s`, { error: e.message });
+      }
+    }
   }
 
   async _capture15s(state) {
@@ -206,6 +262,16 @@ class SignalReactionTracker {
     state.price_15s = snap?.price ?? state.price_5s ?? state.price_0;
     state.oi_15s = snap?.openInterest || state.oi_5s || state.oi_0;
     logger.debug(`Reaction ${state.id}: price_15s=${state.price_15s}, oi_15s=${state.oi_15s}`);
+
+    if (tradeStreamService) {
+      try {
+        state.flow_15s = tradeStreamService.getFlowMetrics(
+          state.symbol, state.startTime, state.startTime + 15_000
+        );
+      } catch (e) {
+        logger.warn(`Reaction ${state.id}: failed to capture flow_15s`, { error: e.message });
+      }
+    }
   }
 
   async _capture60s(state) {
@@ -214,6 +280,16 @@ class SignalReactionTracker {
     state.price_60s = snap?.price ?? state.price_15s ?? state.price_0;
     state.oi_60s = snap?.openInterest || state.oi_0;
     logger.debug(`Reaction ${state.id}: price_60s=${state.price_60s}, oi_60s=${state.oi_60s}`);
+
+    if (tradeStreamService) {
+      try {
+        state.flow_60s = tradeStreamService.getFlowMetrics(
+          state.symbol, state.startTime, state.startTime + 60_000
+        );
+      } catch (e) {
+        logger.warn(`Reaction ${state.id}: failed to capture flow_60s`, { error: e.message });
+      }
+    }
 
     this._finalize(state);
   }
@@ -305,6 +381,9 @@ class SignalReactionTracker {
       label: pathLabel,
     };
 
+    // ── Participation (trade flow) ─────────────────────────
+    const participation = this._computeParticipation(state);
+
     // ── Market context (secondary diagnostics) ─────────────
     const preEventTime = state.startTime - 1_000;
     const range5m = priceStreamService.getRange(state.symbol, config.CONTEXT_SHORT_RANGE_MS, preEventTime);
@@ -345,6 +424,7 @@ class SignalReactionTracker {
       lowData5m,
       lowData30m,
       pathQuality,
+      participation,
     };
 
     // ── Confidence score ──────────────────────────────────
@@ -353,7 +433,7 @@ class SignalReactionTracker {
     reaction.confidenceLabel = confidenceLabel;
 
     logger.info(
-      `Reaction ${state.id}: ${pathLabel} | MFE=${mfe.toFixed(2)}% MAE=${mae.toFixed(2)}% final=${finalMove.toFixed(2)}% ret=${retention !== null ? retention.toFixed(2) : 'N/A'} eff=${efficiency.toFixed(2)} tMFE=${timeToMFE.toFixed(1)}s`
+      `Reaction ${state.id}: ${pathLabel} | flow=${participation.label} | MFE=${mfe.toFixed(2)}% MAE=${mae.toFixed(2)}% final=${finalMove.toFixed(2)}% ret=${retention !== null ? retention.toFixed(2) : 'N/A'} eff=${efficiency.toFixed(2)} tMFE=${timeToMFE.toFixed(1)}s`
     );
 
     for (const cb of this.reactionCallbacks) {
@@ -363,6 +443,86 @@ class SignalReactionTracker {
         logger.error('Error in reaction callback', { error });
       }
     }
+  }
+
+  /**
+   * Compute trade flow participation metrics from captured flow snapshots.
+   * Measures voluntary trade flow around the liquidation event.
+   * @param {SignalState} state
+   * @returns {ParticipationResult}
+   */
+  _computeParticipation(state) {
+    const { flow_5s, flow_15s, flow_60s, flowBaseline, side, L_now } = state;
+
+    // No flow data — return empty
+    if (!flow_15s || !flow_60s) {
+      return {
+        cvd_5s: 0, cvd_15s: 0, cvd_60s: 0,
+        cvd5_aligned: 0, cvd15_aligned: 0, cvd60_aligned: 0,
+        participationRatio: 0,
+        aggressorBuyRatio_baseline: null,
+        aggressorBuyRatio_reaction: null,
+        aggBuyShift: null,
+        largeCvdAligned_15s: 0,
+        largeParticipation: 0,
+        intensitySurge: 1,
+        tradeCount_15s: 0,
+        label: 'insufficient_flow_data',
+      };
+    }
+
+    const favDir = side === 'short' ? 1 : -1;
+
+    const cvd_5s = flow_5s?.cvd ?? 0;
+    const cvd_15s = flow_15s.cvd;
+    const cvd_60s = flow_60s.cvd;
+
+    const cvd5_aligned = cvd_5s * favDir;
+    const cvd15_aligned = cvd_15s * favDir;
+    const cvd60_aligned = cvd_60s * favDir;
+
+    // Ratio of post-signal aggressive flow vs liquidation size
+    const participationRatio = L_now > 0 ? cvd5_aligned / L_now : 0;
+
+    // Aggressor balance shift vs baseline
+    const baselineAggBuy = flowBaseline?.aggressorBuyRatio ?? null;
+    const reactionAggBuy = flow_15s.aggressorBuyRatio;
+    let aggBuyShift = null;
+    if (baselineAggBuy !== null && reactionAggBuy !== null) {
+      aggBuyShift = side === 'short'
+        ? reactionAggBuy - baselineAggBuy   // for shorts, expect MORE buys
+        : baselineAggBuy - reactionAggBuy;  // for longs, expect MORE sells (lower buy ratio)
+    }
+
+    // Large trade participation
+    const largeCvdAligned_15s = flow_15s.largeCvd * favDir;
+    const largeParticipation = flow_15s.totalVolume > 0
+      ? (flow_15s.largeCvd * favDir) / flow_15s.totalVolume
+      : 0;
+
+    // Intensity surge
+    const baselineIntensity = flowBaseline?.tradeIntensity || 0.01;
+    const intensitySurge = flow_15s.tradeIntensity / baselineIntensity;
+
+    // Label
+    const label = deriveParticipationLabel({
+      cvd15_aligned, cvd60_aligned, participationRatio,
+      largeCvdAligned_15s, intensitySurge, flow_15s,
+    });
+
+    return {
+      cvd_5s, cvd_15s, cvd_60s,
+      cvd5_aligned, cvd15_aligned, cvd60_aligned,
+      participationRatio,
+      aggressorBuyRatio_baseline: baselineAggBuy,
+      aggressorBuyRatio_reaction: reactionAggBuy,
+      aggBuyShift,
+      largeCvdAligned_15s,
+      largeParticipation,
+      intensitySurge,
+      tradeCount_15s: flow_15s.tradeCount,
+      label,
+    };
   }
 
   _typeLabel(side) {
@@ -398,6 +558,9 @@ class SignalReactionTracker {
     // Path Quality section
     const pathBlock = this._buildPathQualityBlock(pq);
 
+    // Trade Flow section
+    const flowBlock = this._buildTradeFlowBlock(reaction.participation);
+
     // Confidence
     const confidenceLine = reaction.confidenceScore !== undefined
       ? `\nConfidence: ${reaction.confidenceScore}/10 (${reaction.confidenceLabel})`
@@ -412,13 +575,13 @@ class SignalReactionTracker {
       ...oiLines,
       ...contextLines,
       ...pathBlock,
+      ...flowBlock,
       confidenceLine,
     ].filter(Boolean).join('\n');
   }
 
   /**
    * Build the Path Quality display block.
-   * Template varies by path label.
    * @param {PathQuality} pq
    * @returns {string[]}
    */
@@ -427,36 +590,26 @@ class SignalReactionTracker {
 
     const lines = ['', '📐 Path Quality'];
 
-    // Core metrics line
     const mfeLine = `- MFE ${this._fmtPct(pq.mfe)} in ${pq.timeToMFE.toFixed(0)}s | MAE ${this._fmtPct(pq.mae)}`;
     lines.push(mfeLine);
 
-    // Retention
     if (pq.retention !== null) {
       const retPct = Math.round(pq.retention * 100);
       const retNote = pq.retention < 0.3 ? ' (faded)' : '';
       lines.push(`- Retention: ${retPct}%${retNote}`);
     }
 
-    // Efficiency
     const effDesc = pq.efficiency > 0.7 ? ' (clean path)' : pq.efficiency < 0 ? ' (reversal)' : '';
     lines.push(`- Efficiency: ${pq.efficiency.toFixed(2)}${effDesc}`);
 
-    // Final move
     lines.push(`- Final: ${this._fmtPct(pq.finalMove)}`);
 
-    // Interpretation line
     lines.push('');
     lines.push(...this._pathInterpretationLines(pq));
 
     return lines;
   }
 
-  /**
-   * Human-readable interpretation lines based on path label.
-   * @param {PathQuality} pq
-   * @returns {string[]}
-   */
   _pathInterpretationLines(pq) {
     switch (pq.label) {
       case 'clean_continuation':
@@ -482,9 +635,81 @@ class SignalReactionTracker {
     }
   }
 
+  /**
+   * Build the Trade Flow (CVD) display block.
+   * @param {ParticipationResult} p
+   * @returns {string[]}
+   */
+  _buildTradeFlowBlock(p) {
+    if (!p) return [];
+
+    const lines = ['', '🔊 Trade Flow'];
+
+    if (p.label === 'insufficient_flow_data') {
+      lines.push(`- Only ${p.tradeCount_15s} trades in 15s window`);
+      lines.push(`- ⚠️ Insufficient flow data — interpret with caution`);
+      return lines;
+    }
+
+    // CVD aligned
+    const cvdStr = p.cvd15_aligned >= 0
+      ? `+$${this._fmtUsd(p.cvd15_aligned)} aligned`
+      : `-$${this._fmtUsd(Math.abs(p.cvd15_aligned))} (against direction!)`;
+    lines.push(`- CVD (15s): ${cvdStr}`);
+
+    // Participation ratio
+    lines.push(`- Participation ratio: ${p.participationRatio.toFixed(1)}x liquidation`);
+
+    // Aggressor shift
+    if (p.aggBuyShift !== null) {
+      const shiftPct = Math.round(p.aggBuyShift * 100);
+      const shiftDir = p.aggBuyShift > 0 ? '+' : '';
+      lines.push(`- Aggressor shift: ${shiftDir}${shiftPct}% ${p.aggBuyShift > 0 ? 'toward expected direction' : 'against expected direction'}`);
+    }
+
+    // Large traders
+    if (Math.abs(p.largeParticipation) > 0.05) {
+      const lpPct = Math.round(p.largeParticipation * 100);
+      const lpDir = p.largeParticipation > 0 ? 'aligned' : 'against';
+      lines.push(`- Large traders: ${lpDir} (${lpPct > 0 ? '+' : ''}${lpPct}%)`);
+    }
+
+    // Intensity
+    lines.push(`- Intensity: ${p.intensitySurge.toFixed(1)}x baseline`);
+
+    // Interpretation
+    lines.push('');
+    lines.push(...this._flowInterpretationLines(p));
+
+    return lines;
+  }
+
+  _flowInterpretationLines(p) {
+    switch (p.label) {
+      case 'strong_aligned_participation':
+        return ['→ STRONG ALIGNED PARTICIPATION', '→ real players pushing in liquidation direction'];
+      case 'passive_aligned':
+        return ['→ PASSIVE ALIGNED', '→ flow agrees but not dominant'];
+      case 'liquidity_vacuum':
+        return ['⚠️ LIQUIDITY VACUUM', '→ move not supported by real flow', '→ high instability risk'];
+      case 'absorption_against':
+        return ['⚠️ ABSORPTION AGAINST', '→ large players trading opposite', '→ high reversal risk'];
+      case 'mixed_flow':
+        return ['→ MIXED FLOW', '→ no clear directional consensus'];
+      default:
+        return [];
+    }
+  }
+
   _fmtPct(value) {
     const sign = value >= 0 ? '+' : '';
     return `${sign}${value.toFixed(2)}%`;
+  }
+
+  _fmtUsd(value) {
+    if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+    if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(0)}K`;
+    return value.toFixed(0);
   }
 
   _removeSignal(state) {
@@ -563,6 +788,10 @@ class SignalReactionTracker {
  * @property {number|null} extremePriceSeen
  * @property {number|null} adverseExtreme
  * @property {number} timeOfMFE
+ * @property {import('./tradeStreamService.js').FlowMetrics|null} flowBaseline
+ * @property {import('./tradeStreamService.js').FlowMetrics|null} flow_5s
+ * @property {import('./tradeStreamService.js').FlowMetrics|null} flow_15s
+ * @property {import('./tradeStreamService.js').FlowMetrics|null} flow_60s
  * @property {{ t5: NodeJS.Timeout|null, t15: NodeJS.Timeout|null, t60: NodeJS.Timeout|null, cleanup: NodeJS.Timeout|null }} timers
  * @property {boolean} merged
  * @property {number} mergeCount
@@ -579,6 +808,25 @@ class SignalReactionTracker {
  * @property {boolean} isSweep
  * @property {'no_impulse'|'early_peak'|'mid_peak'|'late_peak'} momentumPhase
  * @property {boolean} hasMeaningfulImpulse
+ * @property {string} label
+ */
+
+/**
+ * @typedef {object} ParticipationResult
+ * @property {number} cvd_5s
+ * @property {number} cvd_15s
+ * @property {number} cvd_60s
+ * @property {number} cvd5_aligned
+ * @property {number} cvd15_aligned
+ * @property {number} cvd60_aligned
+ * @property {number} participationRatio
+ * @property {number|null} aggressorBuyRatio_baseline
+ * @property {number|null} aggressorBuyRatio_reaction
+ * @property {number|null} aggBuyShift
+ * @property {number} largeCvdAligned_15s
+ * @property {number} largeParticipation
+ * @property {number} intensitySurge
+ * @property {number} tradeCount_15s
  * @property {string} label
  */
 
@@ -603,6 +851,7 @@ class SignalReactionTracker {
  * @property {boolean} lowData5m
  * @property {boolean} lowData30m
  * @property {PathQuality} pathQuality
+ * @property {ParticipationResult} participation
  * @property {number} [confidenceScore]
  * @property {string} [confidenceLabel]
  */

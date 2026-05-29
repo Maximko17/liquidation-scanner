@@ -6,17 +6,20 @@ import tracker from './services/liquidationTracker.js';
 import alertService from './services/alertService.js';
 import reactionTracker from './services/signalReactionTracker.js';
 import priceStreamService from './services/priceStreamService.js';
+import tradeStreamService from './services/tradeStreamService.js';
 
 /**
  * Bybit Liquidation Monitoring System
  *
  * Flow:
  *   1. Fetch symbols from REST API (symbolService)
- *   2. Connect to Bybit WebSocket (single connection)
- *   3. Subscribe to allLiquidation.* topics for all symbols
+ *   2. Connect to Bybit WebSocket (single connection per stream)
+ *   3. Subscribe to liquidation, price, and trade topics
  *   4. Ingest events → liquidationTracker
  *   5. Every 500ms: sliding window → baseline → signal detection
  *   6. On alert: dispatch to Telegram + Pushover
+ *   7. Track post-signal reaction: price path + trade flow (CVD)
+ *   8. On reaction complete: scored secondary alert with path quality + participation
  */
 
 // ── Wire callbacks ──────────────────────────────────────────────
@@ -63,7 +66,7 @@ async function start() {
   try {
     await liquidationStreamService.connect();
   } catch (error) {
-  logger.error('Failed to connect liquidation stream', { error: error.message });
+    logger.error('Failed to connect liquidation stream', { error: error.message });
     process.exit(1);
   }
 
@@ -78,10 +81,18 @@ async function start() {
     logger.error('Failed to connect price stream', { error: error.message });
   }
 
-  // 5. Start the liquidation tracker tick
+  // 5. Start trade stream (separate WS for trade flow / CVD)
+  try {
+    await tradeStreamService.connect();
+    tradeStreamService.subscribeMany(symbolNames);
+  } catch (error) {
+    logger.error('Failed to connect trade stream', { error: error.message });
+  }
+
+  // 6. Start the liquidation tracker tick
   tracker.start();
 
-  // 6. Schedule periodic symbol refresh to pick up new listings
+  // 7. Schedule periodic symbol refresh to pick up new listings
   setInterval(async () => {
     try {
       logger.debug('Running scheduled symbol refresh...');
@@ -90,11 +101,13 @@ async function start() {
         logger.info(`Symbols removed, unsubscribing: ${removed.join(', ')}`);
         liquidationStreamService.unsubscribeMany(removed);
         priceStreamService.unsubscribeMany(removed);
+        tradeStreamService.unsubscribeMany(removed);
       }
       if (added.length > 0) {
         logger.info(`New symbols detected, subscribing: ${added.join(', ')}`);
         liquidationStreamService.subscribeMany(added);
         priceStreamService.subscribeMany(added);
+        tradeStreamService.subscribeMany(added);
       }
     } catch (error) {
       logger.error('Scheduled symbol refresh failed', { error: error.message });
@@ -105,6 +118,7 @@ async function start() {
   logger.info(`   Window: ${config.WINDOW_SIZE_MS}ms | Tick: ${config.WINDOW_TICK_MS}ms | History: ${config.HISTORY_DURATION_MS}ms`);
   logger.info(`   Symbol refresh: every ${config.FETCH_INTERVAL_MS / 60000}min`);
   logger.info(`   Alert channels: ${[config.TELEGRAM_BOT_TOKEN && 'Telegram', config.PUSHOVER_USER_KEY && 'Pushover'].filter(Boolean).join(', ') || 'NONE CONFIGURED'}`);
+  logger.info(`   CVD analysis: ${tradeStreamService.isConnected ? 'enabled' : 'disabled'}`);
 }
 
 // ── Shutdown ────────────────────────────────────────────────────
@@ -115,6 +129,7 @@ async function shutdown(signal) {
   tracker.stop();
   reactionTracker.stop();
   priceStreamService.stop();
+  tradeStreamService.stop();
   await liquidationStreamService.shutdown();
 
   logger.info('Shutdown complete');

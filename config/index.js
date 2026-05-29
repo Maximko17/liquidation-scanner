@@ -105,4 +105,12 @@ export default {
   EVENT_HISTORY_SIZE: parseInt(process.env.EVENT_HISTORY_SIZE, 10) || 50,
   EVENT_HISTORY_WARMUP_COUNT: parseInt(process.env.EVENT_HISTORY_WARMUP_COUNT, 10) || 30,
   MIN_SIZE_EVENT_HISTORY_FILTER: parseInt(process.env.MIN_SIZE_EVENT_HISTORY_FILTER, 10) || 1000,
+
+  // ── Trade Flow (CVD) ──────────────────────────────
+  TRADE_BUFFER_MAX_AGE_MS: parseInt(process.env.TRADE_BUFFER_MAX_AGE_MS, 10) || 120_000,
+  MIN_LARGE_TRADE_USD: parseInt(process.env.MIN_LARGE_TRADE_USD, 10) || 10_000,
+  LARGE_TRADE_P90_MULTIPLIER: parseInt(process.env.LARGE_TRADE_P90_MULTIPLIER, 10) || 2,
+  MIN_TRADES_FOR_FLOW_ANALYSIS: parseInt(process.env.MIN_TRADES_FOR_FLOW_ANALYSIS, 10) || 5,
+  FLOW_BASELINE_WINDOW_MS: parseInt(process.env.FLOW_BASELINE_WINDOW_MS, 10) || 60_000,
+  TRADE_WS_URL: process.env.TRADE_WS_URL || 'wss://stream.bybit.com/v5/public/linear',
 };
