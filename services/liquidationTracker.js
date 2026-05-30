@@ -41,6 +41,7 @@ class LiquidationTracker {
         history: { long: new Deque(), short: new Deque() },
         prevL: { long: 0, short: 0 },
         alertArmed: { long: true, short: true },
+        lastHistoryPush: { long: 0, short: 0 }, // debounce: timestamp of last history sample
       });
     }
   }
@@ -129,9 +130,14 @@ class LiquidationTracker {
     const bufferCutoff = now - config.BUFFER_DURATION_MS;
     data.buffer[side] = events.filter((evt) => evt.time > bufferCutoff);
 
-    // 3. Event-based history: store only meaningful non-zero windows
-    if (L_now > config.MIN_SIZE_EVENT_HISTORY_FILTER) {
+    // 3. Event-based history: store one sample per NON-OVERLAPPING window (debounce).
+    //    L_now is a 3s rolling sum sampled every 0.5s, so a single episode would otherwise
+    //    be pushed ~6× (autocorrelated) and inflate its own p75 baseline. Spacing pushes by
+    //    >= WINDOW_SIZE_MS makes each pushed sample an independent episode.
+    if (L_now > config.MIN_SIZE_EVENT_HISTORY_FILTER
+        && now - data.lastHistoryPush[side] >= config.WINDOW_SIZE_MS) {
       history.push(L_now);
+      data.lastHistoryPush[side] = now;
       // FIFO cap
       while (history.length > config.EVENT_HISTORY_SIZE) {
         history.shift();
