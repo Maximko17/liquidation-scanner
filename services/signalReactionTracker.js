@@ -498,12 +498,26 @@ class SignalReactionTracker {
     const cvd_15s = flow_15s.cvd;
     const cvd_60s = flow_60s.cvd;
 
-    const cvd5_aligned = cvd_5s * favDir;
-    const cvd15_aligned = cvd_15s * favDir;
-    const cvd60_aligned = cvd_60s * favDir;
+    // ── De-contaminate aligned CVD → VOLUNTARY flow ─────────
+    // Raw aligned CVD includes (a) the liquidation's own forced fills, which print in
+    // the trade feed in the aligned direction (a one-time lump → subtract L_now once),
+    // and (b) the symbol's normal background flow (a rate → subtract rate × windowSec).
+    // What remains is the voluntary flow reacting to the event. A negative result is
+    // meaningful: it is genuine absorption (real flow trading against the forced move).
+    const baselineWindowSec = (config.FLOW_BASELINE_WINDOW_MS || 60_000) / 1000;
+    const baselineAlignedPerSec = flowBaseline
+      ? (flowBaseline.cvd * favDir) / baselineWindowSec
+      : 0;
+    const decontam = (rawAligned, windowSec) =>
+      rawAligned - L_now - baselineAlignedPerSec * windowSec;
 
-    // Ratio of post-signal aggressive flow vs liquidation size
-    const participationRatio = L_now > 0 ? cvd5_aligned / L_now : 0;
+    const cvd5_aligned = decontam(cvd_5s * favDir, 5);
+    const cvd15_aligned = decontam(cvd_15s * favDir, 15);
+    const cvd60_aligned = decontam(cvd_60s * favDir, 60);
+
+    // Voluntary aligned flow (15s) relative to the liquidation size.
+    // Uses 15s to match the displayed CVD and the label logic (was 5s — §11 mismatch).
+    const participationRatio = L_now > 0 ? cvd15_aligned / L_now : 0;
 
     // Aggressor balance shift vs baseline
     const baselineAggBuy = flowBaseline?.aggressorBuyRatio ?? null;
@@ -674,13 +688,13 @@ class SignalReactionTracker {
       return lines;
     }
 
-    // CVD aligned
+    // CVD aligned — voluntary flow (liquidation's own fills + baseline removed)
     const cvdStr = p.cvd15_aligned >= 0
-      ? `+$${this._fmtUsd(p.cvd15_aligned)} aligned`
-      : `-$${this._fmtUsd(Math.abs(p.cvd15_aligned))} (against direction!)`;
+      ? `+$${this._fmtUsd(p.cvd15_aligned)} voluntary aligned`
+      : `-$${this._fmtUsd(Math.abs(p.cvd15_aligned))} (absorption against!)`;
     lines.push(`- CVD (15s): ${cvdStr}`);
 
-    // Participation ratio
+    // Participation ratio — voluntary 15s flow vs liquidation size
     lines.push(`- Participation ratio: ${p.participationRatio.toFixed(1)}x liquidation`);
 
     // Aggressor shift
@@ -843,10 +857,10 @@ class SignalReactionTracker {
  * @property {number} cvd_5s
  * @property {number} cvd_15s
  * @property {number} cvd_60s
- * @property {number} cvd5_aligned
- * @property {number} cvd15_aligned
- * @property {number} cvd60_aligned
- * @property {number} participationRatio
+ * @property {number} cvd5_aligned - de-contaminated (voluntary): raw aligned − L_now − baseline
+ * @property {number} cvd15_aligned - de-contaminated (voluntary); negative = absorption against
+ * @property {number} cvd60_aligned - de-contaminated (voluntary)
+ * @property {number} participationRatio - cvd15_aligned / L_now (voluntary 15s flow vs liq size)
  * @property {number|null} aggressorBuyRatio_baseline
  * @property {number|null} aggressorBuyRatio_reaction
  * @property {number|null} aggBuyShift
