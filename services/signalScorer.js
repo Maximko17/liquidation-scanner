@@ -1,4 +1,3 @@
-import { getThresholdConfig } from '../config/index.js';
 
 /**
  * Signal Confidence Scorer
@@ -20,10 +19,11 @@ import { getThresholdConfig } from '../config/index.js';
  * the realized range down). The old 17.5 (sum-of-bests) squashed everything toward 0 and made
  * STRONG/EXTREME unreachable. 11 maps a genuinely strong signal to ~10/10 while keeping the
  * 0–10 cutoffs (4/7/9) reachable. PROVISIONAL — Phase F should set this from the observed
- * raw-score distribution (~95th pct). Revisit when Phase C double-counts (path) are fixed.
- * Section ranges (current): A 0..2, B -3..6.5, C ~-4.4..4.4, D -1..2, E -1..1.
+ * raw-score distribution (~95th pct).
+ * Section ranges (current): A 0..2, B -3.5..5.0, C ~-4.4..4.4, D -1..2, E -1..1.
+ * (B max dropped 6.5→5.0 after 2.1 removed the positive retention reward.)
  */
-const RAW_THEORETICAL_MAX = 11;
+const RAW_THEORETICAL_MAX = 9.5;
 
 /** Score labels by range */
 const LABELS = {
@@ -51,7 +51,7 @@ function scorePathQuality(pq) {
   let score = 0;
   const breakdown = {};
 
-  const { mfe, mae, mfe_sigma, retention, efficiency, isSweep, momentumPhase, hasMeaningfulImpulse } = pq;
+  const { mfe, mfe_sigma, retention, efficiency, momentumPhase, hasMeaningfulImpulse } = pq;
 
   if (!hasMeaningfulImpulse) {
     score -= 1;
@@ -74,43 +74,37 @@ function scorePathQuality(pq) {
   score += mfeScore;
   breakdown.mfe = mfeScore;
 
-  // Efficiency
+  // Efficiency — positive reward only (the fade/reversal case is handled by the single
+  // consolidated fade penalty below, not here).
   let effScore = 0;
   if (efficiency > 0.7) effScore = 2;
   else if (efficiency > 0.4) effScore = 1;
-  else if (efficiency < -0.3) effScore = -2;
-  else if (efficiency < 0) effScore = -1;
   score += effScore;
   breakdown.efficiency = effScore;
 
-  // Retention
-  let retScore = 0;
-  if (retention !== null) {
-    if (retention > 0.7) retScore = 1.5;
-    else if (retention > 0.4) retScore = 0.5;
-    else if (retention < 0) retScore = -1;
-  }
-  score += retScore;
-  breakdown.retention = retScore;
+  // Retention is NOT rewarded here — it is collinear with efficiency (both = finalMove ÷
+  // path size). efficiency owns the upside (it's richer: it also penalises chop via MAE).
+  // retention's only scoring role is the downside (the fade penalty below); it also feeds
+  // the display line. (2.1: removes the retention/efficiency positive double-count.)
 
-  // Momentum phase
+  // Momentum phase — scores timing of the peak (distinct from fade).
   let phaseScore = 0;
   if (momentumPhase === 'late_peak') phaseScore = 1;
   else if (momentumPhase === 'early_peak') phaseScore = -0.5;
   score += phaseScore;
   breakdown.phase = phaseScore;
 
-  // Sweep penalty
-  if (isSweep) {
-    score -= 2;
-    breakdown.sweep = -2;
+  // Single consolidated spike-and-fade penalty. Replaces the four overlapping hits
+  // (negative efficiency, negative retention, isSweep, whipsaw) that all measured the
+  // same phenomenon — price spiked favorably then gave it back. retention = finalMove/mfe
+  // is the cleanest single fade measure. isSweep/whipsaw remain as display labels only.
+  let fadeScore = 0;
+  if (retention !== null) {
+    if (retention < 0) fadeScore = -3;          // reversed back through entry (sweep / failed move)
+    else if (retention < 0.3) fadeScore = -1.5; // gave back most of the move
   }
-
-  // Whipsaw penalty
-  if (mae > mfe * 0.6 && retention !== null && retention < 0.4) {
-    score -= 1;
-    breakdown.whipsaw = -1;
-  }
+  score += fadeScore;
+  if (fadeScore !== 0) breakdown.fade = fadeScore;
 
   return { score, breakdown };
 }
@@ -246,12 +240,10 @@ export function scoreReaction(reaction) {
   }
 
   // ── F. Penalties ───────────────────────────────────────
+  // Data-quality penalty only. Liquidation size is scored once, via the `ratio` bonus in
+  // Section A (relative/vol-aware); absolute size is already gated at detection (absThreshold),
+  // so the old `L_now < absThreshold*2` penalty was a redundant second size term (2.3) — removed.
   if (lowData5m || lowData30m) {
-    score -= 1;
-  }
-
-  const { absThreshold } = getThresholdConfig(reaction.symbol);
-  if (typeof reaction.L_now === 'number' && reaction.L_now < absThreshold * 2) {
     score -= 1;
   }
 
