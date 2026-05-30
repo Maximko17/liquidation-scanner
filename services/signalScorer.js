@@ -15,15 +15,15 @@ import { getThresholdConfig } from '../config/index.js';
  */
 
 /**
- * Theoretical maximum raw score (additive sections only):
- *   A. Ratio:        0 to 2
- *   B. Path quality: -3 to 6.5
- *   C. Participation: -4.5 to 6
- *   D. OI:           -1 to 2
- *   E. Context:      -1 to 1
- *   = 17.5 (penalties subtractive below)
+ * Normalization denominator: a *realistic achievable* strong-signal raw score, NOT the
+ * impossible sum of every section's max (sections don't jointly max out, and negatives drag
+ * the realized range down). The old 17.5 (sum-of-bests) squashed everything toward 0 and made
+ * STRONG/EXTREME unreachable. 11 maps a genuinely strong signal to ~10/10 while keeping the
+ * 0–10 cutoffs (4/7/9) reachable. PROVISIONAL — Phase F should set this from the observed
+ * raw-score distribution (~95th pct). Revisit when Phase C double-counts (path) are fixed.
+ * Section ranges (current): A 0..2, B -3..6.5, C ~-4.4..4.4, D -1..2, E -1..1.
  */
-const RAW_THEORETICAL_MAX = 17.5;
+const RAW_THEORETICAL_MAX = 11;
 
 /** Score labels by range */
 const LABELS = {
@@ -60,10 +60,11 @@ function scorePathQuality(pq) {
   }
 
   // MFE magnitude — volatility-normalized (σ) when available, raw-% fallback otherwise.
+  // σ tiers relaxed (was 3/2/1): a clean reaction is ~2σ; 3σ for the top tier was unreachable.
   let mfeScore = 0;
   if (mfe_sigma != null) {
-    if (mfe_sigma >= 3) mfeScore = 2;
-    else if (mfe_sigma >= 2) mfeScore = 1;
+    if (mfe_sigma >= 2.5) mfeScore = 2;
+    else if (mfe_sigma >= 1.5) mfeScore = 1;
     else if (mfe_sigma >= 1) mfeScore = 0.5;
   } else {
     if (mfe >= 1.0) mfeScore = 2;
@@ -122,72 +123,48 @@ function scorePathQuality(pq) {
  * @returns {{ score: number, breakdown: object }}
  */
 function scoreParticipation(p) {
-  let score = 0;
   const breakdown = {};
 
   const {
     cvd15_aligned, cvd60_aligned, participationRatio,
-    aggBuyShift, largeParticipation, intensitySurge,
-    tradeCount_15s, label,
+    aggBuyShift, largeParticipation, tradeCount_15s, label,
   } = p;
 
-  // Insufficient data — neutral, do not score
+  // Insufficient data — neutral, do not score (data-sufficiency gate, not a categorical label)
   if (label === 'insufficient_flow_data' || tradeCount_15s < 5) {
     breakdown.note = 'insufficient_data';
     return { score: 0, breakdown };
   }
 
-  // Main signal: aligned CVD presence
-  if (label === 'strong_aligned_participation') {
-    score += 3;
-    breakdown.alignedFlow = 3;
-  } else if (label === 'passive_aligned') {
-    score += 1;
-    breakdown.alignedFlow = 1;
-  } else if (label === 'liquidity_vacuum') {
-    score -= 1.5;
-    breakdown.vacuum = -1.5;
-  } else if (label === 'absorption_against') {
-    score -= 2.5;
-    breakdown.absorption = -2.5;
-  }
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-  // Bonus: aggressor balance shift confirms direction
+  // Continuous scoring off the numbers (labels are display-only, §9). All terms smooth
+  // and clamped — no cliff edges. Inputs are de-contaminated (voluntary) flow.
+
+  // Main: voluntary aligned flow vs liquidation size. Signed — positive = continuation
+  // support, negative = absorption against (scaled by magnitude, not a flat penalty).
+  const prTerm = clamp(participationRatio, -1.5, 1.5) * 2;       // ±3
+  breakdown.participation = prTerm;
+
+  // Aggressor balance shift vs baseline (side-corrected upstream).
+  let aggTerm = 0;
   if (aggBuyShift !== null) {
-    if (aggBuyShift > 0.15) {
-      score += 1;
-      breakdown.aggressorShift = 1;
-    } else if (aggBuyShift < -0.15) {
-      score -= 1;
-      breakdown.aggressorShift = -1;
-    }
+    aggTerm = clamp(aggBuyShift, -0.5, 0.5) * 1.5;              // ±0.75
+    breakdown.aggressorShift = aggTerm;
   }
 
-  // Bonus: large traders aligned (institutional confirmation)
-  if (largeParticipation > 0.2) {
-    score += 1;
-    breakdown.largeTraders = 1;
-  } else if (largeParticipation < -0.2) {
-    score -= 1;
-    breakdown.largeTraders = -1;
+  // Large-trader alignment — counted ONCE here (removes the old label double-count).
+  const largeTerm = clamp(largeParticipation, -0.4, 0.4) * 2;   // ±0.8
+  breakdown.largeTraders = largeTerm;
+
+  // Persistence: does the 60s flow still agree in sign with the 15s flow?
+  let persist = 0;
+  if (cvd15_aligned !== 0 && cvd60_aligned !== 0) {
+    persist = Math.sign(cvd60_aligned) === Math.sign(cvd15_aligned) ? 0.3 : -0.3;
+    breakdown.persistence = persist;
   }
 
-  // Bonus: intensity surge (market woke up and engaged)
-  if (intensitySurge > 3 && cvd15_aligned > 0) {
-    score += 0.5;
-    breakdown.intensity = 0.5;
-  }
-
-  // Sanity: persistent flow (60s confirms 15s)
-  if (cvd60_aligned > 0 && cvd15_aligned > 0 && cvd60_aligned >= cvd15_aligned * 0.7) {
-    score += 0.5;
-    breakdown.persistence = 0.5;
-  } else if (cvd15_aligned > 0 && cvd60_aligned < 0) {
-    // Flow reversed within window — bad sign
-    score -= 1;
-    breakdown.flowReversal = -1;
-  }
-
+  const score = prTerm + aggTerm + largeTerm + persist;         // ≈ [-4.4, +4.4]
   return { score, breakdown };
 }
 
