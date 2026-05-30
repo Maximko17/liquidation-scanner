@@ -1,15 +1,14 @@
-
 /**
  * Signal Confidence Scorer
  *
  * Evaluates the strength of a liquidation signal using:
  *   - Liquidation abnormality (ratio)
- *   - Path quality (MFE, MAE, efficiency, retention, momentum phase)
- *   - Participation quality (CVD, aggressor shift, large traders, intensity)
- *   - OI participation (side-aware)
+ *   - Path quality (σ-normalized MFE, efficiency, retention/fade, momentum phase)
+ *   - Participation quality (de-contaminated CVD, aggressor shift, large traders)
  *   - Multi-TF context
  *   - Penalties
  *
+ * (OI delta is computed/displayed by the reaction tracker but not scored — see 3.1.)
  * Returns a normalized score 0–10 (one decimal) with a classification label.
  */
 
@@ -20,8 +19,9 @@
  * STRONG/EXTREME unreachable. 11 maps a genuinely strong signal to ~10/10 while keeping the
  * 0–10 cutoffs (4/7/9) reachable. PROVISIONAL — Phase F should set this from the observed
  * raw-score distribution (~95th pct).
- * Section ranges (current): A 0..2, B -3.5..5.0, C ~-4.4..4.4, D -1..2, E -1..1.
- * (B max dropped 6.5→5.0 after 2.1 removed the positive retention reward.)
+ * Section ranges (current): A 0..2, B -3.5..5.0, C ~-4.4..4.4, E -1..1.
+ * (B max dropped 6.5→5.0 after 2.1 removed the positive retention reward; section D / OI removed
+ * from scoring in 3.1 — it contributed ~0 in practice, so the denominator is unchanged.)
  */
 const RAW_THEORETICAL_MAX = 9.5;
 
@@ -163,28 +163,6 @@ function scoreParticipation(p) {
 }
 
 /**
- * Score OI delta with side-aware interpretation.
- *
- * SHORT liquidation (price went UP):
- *   dOI > 0 = new LONGS entering (bullish continuation confirmation)
- *   dOI < 0 = shorts just closing, no new longs (weak basis)
- *
- * LONG liquidation (price went DOWN):
- *   dOI > 0 = new SHORTS entering (bearish continuation confirmation)
- *   dOI < 0 = longs just capitulating, no new shorts (possible bounce)
- *
- * @param {number} dOI - OI delta in %
- * @param {'long'|'short'} side
- * @returns {number}
- */
-function scoreOI(dOI, side) {
-  if (dOI > 2) return 2;
-  if (dOI > 1) return 1;
-  if (dOI < -2) return -1;
-  return 0;
-}
-
-/**
  * Score a reaction result.
  *
  * @param {import('./signalReactionTracker.js').ReactionResult} reaction
@@ -193,7 +171,7 @@ function scoreOI(dOI, side) {
 export function scoreReaction(reaction) {
   let score = 0;
 
-  const { ratio, dOI, side, position_5m, position_30m, lowData5m, lowData30m, pathQuality, participation } = reaction;
+  const { ratio, position_5m, position_30m, lowData5m, lowData30m, pathQuality, participation } = reaction;
 
   // ── A. Liquidation strength (ratio) ────────────────────
   if (ratio >= 12) {
@@ -214,8 +192,9 @@ export function scoreReaction(reaction) {
     score += scoreParticipation(participation).score;
   }
 
-  // ── D. OI delta (side-aware) ───────────────────────────
-  score += scoreOI(dOI, side);
+  // ── D. (removed) OI delta — 60s ΔOI is too small/sparse to score reliably (3.1).
+  // ΔOI is still computed & displayed by the reaction tracker and flagged for Phase F logging;
+  // revisit as a side-aware / reversal input once data earns it.
 
   // ── E. Multi-TF context ────────────────────────────────
   let isHigh5m = false;
