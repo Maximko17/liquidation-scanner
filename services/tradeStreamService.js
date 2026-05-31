@@ -46,6 +46,7 @@ class TradeStreamService {
     this.isConnected = false;
     this.pingInterval = null;
     this._pendingResubscribe = null;
+    this._serverTimeOffset = 0; // Clock drift correction (ms), aligns exchange T to local clock
 
     /** @type {Array<Function>} */
     this.tradeCallbacks = [];
@@ -280,7 +281,19 @@ class TradeStreamService {
    * @param {object} rawTrade - Raw Bybit trade object
    */
   _ingestTrade(symbol, rawTrade) {
-    const time = typeof rawTrade.T === 'number' ? rawTrade.T : Date.now();
+    const rawT = typeof rawTrade.T === 'number' ? rawTrade.T : Date.now();
+    // Clock-drift correction: align Bybit's exchange timestamp to the LOCAL clock, so the
+    // reaction tracker's flow windows (built from local-clock alert timestamps + the local-clock
+    // price buffer) line up with this trade buffer. Without it, a drifted machine clock shifts
+    // the [startTime, startTime+window] query off the trades → participation silently reads 0.
+    // Mirrors liquidationStreamService's correction; computed once on the first trade.
+    if (this._serverTimeOffset === 0) {
+      this._serverTimeOffset = Date.now() - rawT;
+      if (Math.abs(this._serverTimeOffset) > 5000) {
+        logger.warn(`[tradeStream] Clock drift detected: ${this._serverTimeOffset}ms offset from Bybit server`);
+      }
+    }
+    const time = rawT + this._serverTimeOffset;
     const side = rawTrade.S === 'Buy' ? 'buy' : 'sell';
     const volume = parseFloat(rawTrade.v) || 0;
     const price = parseFloat(rawTrade.p) || 0;
