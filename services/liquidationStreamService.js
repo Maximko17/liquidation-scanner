@@ -106,7 +106,9 @@ class LiquidationStreamService {
 
     this.pingInterval = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.ping();
+        // Bybit v5 keepalive is an application-level JSON ping, NOT a WS protocol ping
+        // frame — protocol pings don't reset Bybit's server-side timer → periodic closes.
+        this.ws.send(JSON.stringify({ op: 'ping' }));
         logger.debug('[liquidationStream] ping');
       }
     }, interval);

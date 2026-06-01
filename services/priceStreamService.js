@@ -117,7 +117,8 @@ class PriceStreamService {
     this._stopPing();
     this.pingInterval = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.ping();
+        // Bybit v5 keepalive: application-level JSON ping (not a WS protocol ping frame).
+        this.ws.send(JSON.stringify({ op: 'ping' }));
       }
     }, 20_000);
   }
