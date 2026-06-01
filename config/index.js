@@ -120,5 +120,9 @@ export default {
   LARGE_TRADE_P90_MULTIPLIER: parseInt(process.env.LARGE_TRADE_P90_MULTIPLIER, 10) || 2,
   MIN_TRADES_FOR_FLOW_ANALYSIS: parseInt(process.env.MIN_TRADES_FOR_FLOW_ANALYSIS, 10) || 5,
   FLOW_BASELINE_WINDOW_MS: parseInt(process.env.FLOW_BASELINE_WINDOW_MS, 10) || 60_000,
+  // Data-liveness watchdog: force-reconnect the trade stream if no trade frame arrives
+  // (across ALL symbols) for this long while the socket is still "connected" — detects a
+  // silent data stall that the keepalive ping cannot (control channel alive, data dead).
+  TRADE_STALL_TIMEOUT_MS: parseInt(process.env.TRADE_STALL_TIMEOUT_MS, 10) || 30_000,
   TRADE_WS_URL: process.env.TRADE_WS_URL || 'wss://stream.bybit.com/v5/public/linear',
 };

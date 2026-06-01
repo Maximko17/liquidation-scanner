@@ -45,6 +45,8 @@ class TradeStreamService {
     this.shouldReconnect = true;
     this.isConnected = false;
     this.pingInterval = null;
+    this.watchdogInterval = null;
+    this._lastDataAt = 0; // ms timestamp of the last received trade frame (any symbol); 0 = none yet
     this._pendingResubscribe = null;
     this._serverTimeOffset = 0; // Clock drift correction (ms), aligns exchange T to local clock
 
@@ -65,9 +67,11 @@ class TradeStreamService {
       this.ws.on('open', () => {
         this.isConnected = true;
         this.reconnectAttempts = 0;
+        this._lastDataAt = Date.now(); // don't judge a fresh socket stale before first data
         logger.info('[tradeStream] WebSocket connected');
 
         this._startPing();
+        this._startWatchdog();
 
         if (this._pendingResubscribe && this._pendingResubscribe.length > 0) {
           const symbols = this._pendingResubscribe;
@@ -100,6 +104,7 @@ class TradeStreamService {
       this.ws.on('close', (code, reason) => {
         this.isConnected = false;
         this._stopPing();
+        this._stopWatchdog();
 
         this._pendingResubscribe = Array.from(this.subscribedSymbols);
         this.subscribedSymbols.clear();
@@ -124,6 +129,42 @@ class TradeStreamService {
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
+    }
+  }
+
+  /**
+   * Data-liveness watchdog: the keepalive ping keeps the control channel alive but cannot
+   * detect a data-only stall (Bybit silently stops pushing trade frames while the socket stays
+   * open). If no trade frame has arrived across ALL symbols within TRADE_STALL_TIMEOUT_MS, force
+   * a hard close → the existing close→reconnect→resubscribe path revives the feed.
+   */
+  _startWatchdog() {
+    this._stopWatchdog();
+    const timeout = config.TRADE_STALL_TIMEOUT_MS || 30_000;
+    // Check at ~1/3 of the timeout so detection latency stays well under the timeout itself.
+    const checkEvery = Math.max(5_000, Math.floor(timeout / 3));
+    this.watchdogInterval = setInterval(() => this._checkDataLiveness(), checkEvery);
+  }
+
+  /**
+   * One liveness check: force-reconnect if the trade feed has been silent past the timeout.
+   * Extracted from the interval so it can be driven directly in tests.
+   */
+  _checkDataLiveness() {
+    if (!this.isConnected || !this._lastDataAt) return;
+    const timeout = config.TRADE_STALL_TIMEOUT_MS || 30_000;
+    const stallMs = Date.now() - this._lastDataAt;
+    if (stallMs > timeout) {
+      logger.warn(`[tradeStream] Data stall: no trades for ${stallMs}ms (> ${timeout}ms) — forcing reconnect`);
+      this._lastDataAt = 0; // avoid repeated terminates before the socket actually closes
+      if (this.ws) this.ws.terminate();
+    }
+  }
+
+  _stopWatchdog() {
+    if (this.watchdogInterval) {
+      clearInterval(this.watchdogInterval);
+      this.watchdogInterval = null;
     }
   }
 
@@ -231,6 +272,9 @@ class TradeStreamService {
       const trades = message.data;
 
       if (!Array.isArray(trades)) return;
+
+      // Data-liveness mark: one cheap timestamp write per frame (not per trade) — feeds the watchdog.
+      this._lastDataAt = Date.now();
 
       for (const trade of trades) {
         this._ingestTrade(symbol, trade);
@@ -471,6 +515,42 @@ class TradeStreamService {
     };
   }
 
+  /**
+   * TEMP DIAGNOSTIC — snapshot of a symbol's trade subscription/buffer state.
+   * Used to localize intermittent "0 trades in window" alerts. Remove after diagnosis.
+   * @param {string} symbol
+   * @returns {object}
+   */
+  getDebugInfo(symbol) {
+    const buffer = this.tradeBuffer.get(symbol);
+    const bufferLen = buffer ? buffer.length : 0;
+
+    // Freshest trade across ALL symbols → distinguishes a whole-stream stall
+    // (streamLastAgeMs also large) from a single-topic stall (this symbol stale,
+    // stream fresh).
+    let streamLastTime = null;
+    for (const [, buf] of this.tradeBuffer) {
+      if (buf.length > 0) {
+        const t = buf[buf.length - 1].time;
+        if (streamLastTime === null || t > streamLastTime) streamLastTime = t;
+      }
+    }
+
+    return {
+      connected: this.isConnected,
+      subscribed: this.subscribedSymbols.has(symbol),
+      blacklisted: this.blacklist.has(symbol),
+      totalSubscribed: this.subscribedSymbols.size,
+      totalBufferedSymbols: this.tradeBuffer.size,
+      serverTimeOffset: this._serverTimeOffset,
+      bufferLen,
+      firstTime: bufferLen > 0 ? buffer[0].time : null,
+      lastTime: bufferLen > 0 ? buffer[bufferLen - 1].time : null,
+      streamLastTime,
+      streamLastAgeMs: streamLastTime !== null ? Date.now() - streamLastTime : null,
+    };
+  }
+
   // ═══════════════════════════════════════════════════════════
   // Lifecycle
   // ═══════════════════════════════════════════════════════════
@@ -485,6 +565,7 @@ class TradeStreamService {
     this.isConnected = false;
 
     this._stopPing();
+    this._stopWatchdog();
 
     if (this.ws) {
       this.ws.close();

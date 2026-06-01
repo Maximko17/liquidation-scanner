@@ -28,8 +28,10 @@ import logger from '../utils/logger.js';
  * Derive a human-readable path label from geometry metrics.
  * This is for display only — scoring uses continuous metrics, not this label.
  */
-function derivePathLabel({ mfe, mae, finalMove, retention, efficiency, isSweep, momentumPhase, hasMeaningfulImpulse }) {
+function derivePathLabel({ mfe, mae, finalMove, retention, efficiency, isSweep, momentumPhase, hasMeaningfulImpulse, hasMeaningfulAdverse }) {
   if (!hasMeaningfulImpulse) {
+    // No favorable (continuation) impulse — but did price move hard the OTHER way?
+    if (hasMeaningfulAdverse) return 'rejected';  // reversal against the liquidation, not absorption
     if (mae < 0.2) return 'dead_reaction';
     return 'absorbed';
   }
@@ -271,6 +273,18 @@ class SignalReactionTracker {
         state.flow_15s = tradeStreamService.getFlowMetrics(
           state.symbol, state.startTime, state.startTime + 15_000
         );
+        // TEMP DIAGNOSTIC: localize intermittent "0 trades in 15s window" (remove after diagnosis).
+        if (!state.flow_15s || state.flow_15s.tradeCount === 0) {
+          const dbg = tradeStreamService.getDebugInfo
+            ? tradeStreamService.getDebugInfo(state.symbol)
+            : null;
+          const lagNote = dbg && dbg.lastTime !== null
+            ? ` | startTime-lastTime=${state.startTime - dbg.lastTime}ms`
+            : '';
+          logger.warn(
+            `[flowDiag] ${state.id}: 0 trades in 15s window [${state.startTime}, ${state.startTime + 15_000}] — ${JSON.stringify(dbg)}${lagNote}`
+          );
+        }
       } catch (e) {
         logger.warn(`Reaction ${state.id}: failed to capture flow_15s`, { error: e.message });
       }
@@ -354,6 +368,13 @@ class SignalReactionTracker {
       ? mfe_sigma >= config.MIN_MEANINGFUL_MFE_SIGMA
       : mfe >= config.MIN_MEANINGFUL_MFE_PCT;
 
+    // Symmetric gate on the ADVERSE side: was there a meaningful move *against* the
+    // liquidation? Same σ threshold (raw-% fallback). Distinguishes a rejection/reversal
+    // (no favorable impulse but price moved hard the other way) from true absorption.
+    const hasMeaningfulAdverse = mae_sigma !== null
+      ? mae_sigma >= config.MIN_MEANINGFUL_MFE_SIGMA
+      : mae >= config.MIN_MEANINGFUL_MFE_PCT;
+
     const retention = hasMeaningfulImpulse
       ? Math.max(-1, Math.min(1, finalMove / mfe))
       : null;
@@ -381,7 +402,7 @@ class SignalReactionTracker {
 
     const pathLabel = derivePathLabel({
       mfe, mae, finalMove, retention, efficiency,
-      isSweep, momentumPhase, hasMeaningfulImpulse,
+      isSweep, momentumPhase, hasMeaningfulImpulse, hasMeaningfulAdverse,
     });
 
     /** @type {PathQuality} */
@@ -667,6 +688,8 @@ class SignalReactionTracker {
         return ['→ DEAD REACTION', '→ no meaningful displacement', '→ market ignored the liquidation'];
       case 'absorbed':
         return ['→ ABSORBED', '→ event was absorbed without moving price'];
+      case 'rejected':
+        return ['⚠️ REJECTED', '→ no continuation — price reversed against the liquidation', '→ possible fade/reversal setup'];
       default:
         return [`→ ${pq.label.replace(/_/g, ' ').toUpperCase()}`];
     }
