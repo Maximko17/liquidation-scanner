@@ -85,6 +85,8 @@ export default {
   ALERT_COOLDOWN_MS: parseInt(process.env.ALERT_COOLDOWN_MS, 10) || 10_000,
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
+  TELEGRAM_SEND_RETRIES: parseInt(process.env.TELEGRAM_SEND_RETRIES, 10) || 3,
+  TELEGRAM_RETRY_BASE_MS: parseInt(process.env.TELEGRAM_RETRY_BASE_MS, 10) || 1000,
   PUSHOVER_USER_KEY: process.env.PUSHOVER_USER_KEY || '',
   PUSHOVER_APP_TOKEN: process.env.PUSHOVER_APP_TOKEN || '',
 

@@ -206,32 +206,43 @@ class AlertService {
   }
 
   /**
-   * Send a message via Telegram Bot API using node-telegram-bot-api.
+   * Send a message via Telegram Bot API with retries + exponential backoff.
+   * Transient failures (network blips, Telegram 5xx/429) are common; retry before giving up.
+   * Honors Telegram's `retry_after` hint on rate-limit (429) responses when present.
+   * Rejects only after all attempts are exhausted (callers log the final failure).
    * @param {string} text
    * @returns {Promise<void>}
    */
-  _sendTelegram(text) {
-    return new Promise((resolve, reject) => {
-      try {
-        if (!this.telegramBot) {
-          this.telegramBot = new TelegramBot(config.TELEGRAM_BOT_TOKEN);
-        }
+  async _sendTelegram(text) {
+    if (!this.telegramBot) {
+      this.telegramBot = new TelegramBot(config.TELEGRAM_BOT_TOKEN);
+    }
 
-        this.telegramBot.sendMessage(config.TELEGRAM_CHAT_ID, text, {
+    const maxAttempts = config.TELEGRAM_SEND_RETRIES || 3;
+    const baseDelay = config.TELEGRAM_RETRY_BASE_MS || 1000;
+    let lastErr;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.telegramBot.sendMessage(config.TELEGRAM_CHAT_ID, text, {
           parse_mode: 'Markdown',
           disable_web_page_preview: false,
-        })
-          .then(() => {
-            logger.info('✅ Telegram alert sent');
-            resolve();
-          })
-          .catch((err) => {
-            reject(new Error(`Telegram send failed: ${err.message}`));
-          });
+        });
+        logger.info(`✅ Telegram alert sent${attempt > 1 ? ` (attempt ${attempt})` : ''}`);
+        return;
       } catch (err) {
-        reject(new Error(`Telegram init error: ${err.message}`));
+        lastErr = err;
+        if (attempt < maxAttempts) {
+          // Respect Telegram's rate-limit hint (429) if present, else exponential backoff.
+          const retryAfter = err?.response?.body?.parameters?.retry_after;
+          const delay = retryAfter ? retryAfter * 1000 : baseDelay * Math.pow(2, attempt - 1);
+          logger.warn(`Telegram send attempt ${attempt}/${maxAttempts} failed: ${err.message} — retrying in ${delay}ms`);
+          await new Promise((r) => setTimeout(r, delay));
+        }
       }
-    });
+    }
+
+    throw new Error(`Telegram send failed after ${maxAttempts} attempts: ${lastErr?.message}`);
   }
 
   /**
