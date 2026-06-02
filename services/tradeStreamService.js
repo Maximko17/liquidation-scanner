@@ -143,6 +143,7 @@ class TradeStreamService {
     const timeout = config.TRADE_STALL_TIMEOUT_MS || 30_000;
     // Check at ~1/3 of the timeout so detection latency stays well under the timeout itself.
     const checkEvery = Math.max(5_000, Math.floor(timeout / 3));
+    logger.info(`[tradeStream] watchdog armed (stall timeout=${timeout}ms, check every ${checkEvery}ms)`);
     this.watchdogInterval = setInterval(() => this._checkDataLiveness(), checkEvery);
   }
 
