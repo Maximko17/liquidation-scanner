@@ -124,6 +124,9 @@ export default {
   // ── Trade Flow (CVD) ──────────────────────────────
   TRADE_BUFFER_MAX_AGE_MS: parseInt(process.env.TRADE_BUFFER_MAX_AGE_MS, 10) || 120_000,
   MIN_LARGE_TRADE_USD: parseInt(process.env.MIN_LARGE_TRADE_USD, 10) || 10_000,
+  // Recompute the (expensive p90-sort) large-trade threshold at most once per this interval per
+  // symbol; every trade is still compared against the cached threshold. Caps per-trade CPU.
+  LARGE_TRADE_RECALC_MS: parseInt(process.env.LARGE_TRADE_RECALC_MS, 10) || 5_000,
   LARGE_TRADE_P90_MULTIPLIER: parseInt(process.env.LARGE_TRADE_P90_MULTIPLIER, 10) || 2,
   MIN_TRADES_FOR_FLOW_ANALYSIS: parseInt(process.env.MIN_TRADES_FOR_FLOW_ANALYSIS, 10) || 5,
   FLOW_BASELINE_WINDOW_MS: parseInt(process.env.FLOW_BASELINE_WINDOW_MS, 10) || 60_000,

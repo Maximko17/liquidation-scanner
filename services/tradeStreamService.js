@@ -30,6 +30,9 @@ class TradeStreamService {
     /** @type {Map<string, Array<NormalizedTrade>>} symbol → trade buffer */
     this.tradeBuffer = new Map();
 
+    /** @type {Map<string, {value:number, at:number}>} symbol → cached large-trade threshold */
+    this._largeThreshold = new Map();
+
     /** @type {Set<string>} */
     this.subscribedSymbols = new Set();
 
@@ -225,6 +228,7 @@ class TradeStreamService {
     for (const s of toRemove) {
       this.subscribedSymbols.delete(s);
       this.tradeBuffer.delete(s);
+      this._largeThreshold.delete(s);
     }
   }
 
@@ -410,6 +414,7 @@ class TradeStreamService {
     const lookbackMs = 300_000; // 5 minutes
     const multiplier = config.LARGE_TRADE_P90_MULTIPLIER || 2;
     const minLargeUsd = config.MIN_LARGE_TRADE_USD || 10_000;
+    const recalcMs = config.LARGE_TRADE_RECALC_MS || 5_000;
 
     // Warmup: not enough history yet
     if (buffer.length < minTrades) {
@@ -417,22 +422,31 @@ class TradeStreamService {
       return;
     }
 
-    // Collect sizes from last 5 minutes
-    const sizes = [];
-    const cutoff = now - lookbackMs;
-    for (let i = buffer.length - 1; i >= 0; i--) {
-      if (buffer[i].time < cutoff) break;
-      sizes.push(buffer[i].size);
+    // The threshold is the EXPENSIVE part (a p90 sort over the buffer). Recompute it at most once
+    // per recalcMs PER SYMBOL and cache it; every trade is still compared against the cached value
+    // below. p90 over ~5 min of sizes barely moves within a few seconds, so isLarge accuracy is
+    // unchanged while per-trade CPU drops by orders of magnitude (fixes the event-loop backlog that
+    // pushed buffered trade timestamps minutes behind real time → empty flow windows).
+    let cached = this._largeThreshold.get(symbol);
+    if (!cached || now - cached.at >= recalcMs) {
+      const sizes = [];
+      const cutoff = now - lookbackMs;
+      for (let i = buffer.length - 1; i >= 0; i--) {
+        if (buffer[i].time < cutoff) break;
+        sizes.push(buffer[i].size);
+      }
+
+      if (sizes.length < minTrades) {
+        trade.isLarge = false;
+        return; // not enough in-window history yet — don't cache a bad threshold
+      }
+
+      const p90 = getPercentile(sizes, 0.90);
+      cached = { value: Math.max(p90 * multiplier, minLargeUsd), at: now };
+      this._largeThreshold.set(symbol, cached);
     }
 
-    if (sizes.length < minTrades) {
-      trade.isLarge = false;
-      return;
-    }
-
-    const p90 = getPercentile(sizes, 0.90);
-    const threshold = Math.max(p90 * multiplier, minLargeUsd);
-    trade.isLarge = trade.size > threshold;
+    trade.isLarge = trade.size > cached.value;
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -598,6 +612,7 @@ class TradeStreamService {
 
     this.subscribedSymbols.clear();
     this.tradeBuffer.clear();
+    this._largeThreshold.clear();
     this.blacklist.clear();
     this.tradeCallbacks = [];
     this.currentBatchRequest = null;
