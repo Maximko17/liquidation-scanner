@@ -50,7 +50,6 @@ class TradeStreamService {
     this.pingInterval = null;
     this.watchdogInterval = null;
     this._lastDataAt = 0; // ms timestamp of the last received trade frame (any symbol); 0 = none yet
-    this._lastPongAt = 0; // TEMP DIAG: last Bybit {op:'pong'} (ms)
     this._pendingResubscribe = null;
     this._serverTimeOffset = 0; // Clock drift correction (ms), aligns exchange T to local clock
 
@@ -269,13 +268,6 @@ class TradeStreamService {
   _handleMessage(message) {
     if (message.op === 'subscribe') {
       this._handleSubscribeResponse(message);
-      return;
-    }
-
-    // TEMP DIAG: Bybit JSON keepalive reply — control-channel liveness.
-    // Bybit v5 replies to {op:'ping'} with {op:'ping', ret_msg:'pong'} — pong is in ret_msg.
-    if (message.ret_msg === 'pong' || message.op === 'pong') {
-      this._lastPongAt = Date.now();
       return;
     }
 
@@ -535,57 +527,6 @@ class TradeStreamService {
       largeSellVolume,
       largeCvd,
       tradeIntensity,
-    };
-  }
-
-  /**
-   * TEMP DIAGNOSTIC — snapshot of a symbol's trade subscription/buffer state.
-   * Used to localize intermittent "0 trades in window" alerts. Remove after diagnosis.
-   * @param {string} symbol
-   * @returns {object}
-   */
-  getDebugInfo(symbol) {
-    const buffer = this.tradeBuffer.get(symbol);
-    const bufferLen = buffer ? buffer.length : 0;
-
-    // Freshest trade across ALL symbols → distinguishes a whole-stream stall
-    // (streamLastAgeMs also large) from a single-topic stall (this symbol stale,
-    // stream fresh).
-    let streamLastTime = null;
-    for (const [, buf] of this.tradeBuffer) {
-      if (buf.length > 0) {
-        const t = buf[buf.length - 1].time;
-        if (streamLastTime === null || t > streamLastTime) streamLastTime = t;
-      }
-    }
-
-    return {
-      connected: this.isConnected,
-      subscribed: this.subscribedSymbols.has(symbol),
-      blacklisted: this.blacklist.has(symbol),
-      totalSubscribed: this.subscribedSymbols.size,
-      totalBufferedSymbols: this.tradeBuffer.size,
-      serverTimeOffset: this._serverTimeOffset,
-      bufferLen,
-      firstTime: bufferLen > 0 ? buffer[0].time : null,
-      lastTime: bufferLen > 0 ? buffer[bufferLen - 1].time : null,
-      streamLastTime,
-      streamLastAgeMs: streamLastTime !== null ? Date.now() - streamLastTime : null,
-    };
-  }
-
-  /**
-   * TEMP DIAG: liveness snapshot for the stream-stall investigation. Remove after diagnosis.
-   * @returns {object}
-   */
-  getLiveness() {
-    const now = Date.now();
-    return {
-      connected: this.isConnected,
-      readyState: this.ws ? this.ws.readyState : -1,
-      dataAge: this._lastDataAt ? now - this._lastDataAt : null,
-      pongAge: this._lastPongAt ? now - this._lastPongAt : null,
-      recon: this.reconnectAttempts,
     };
   }
 

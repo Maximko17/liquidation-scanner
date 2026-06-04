@@ -273,18 +273,6 @@ class SignalReactionTracker {
         state.flow_15s = tradeStreamService.getFlowMetrics(
           state.symbol, state.startTime, state.startTime + 15_000
         );
-        // TEMP DIAGNOSTIC: localize intermittent "0 trades in 15s window" (remove after diagnosis).
-        if (!state.flow_15s || state.flow_15s.tradeCount === 0) {
-          const dbg = tradeStreamService.getDebugInfo
-            ? tradeStreamService.getDebugInfo(state.symbol)
-            : null;
-          const lagNote = dbg && dbg.lastTime !== null
-            ? ` | startTime-lastTime=${state.startTime - dbg.lastTime}ms`
-            : '';
-          logger.warn(
-            `[flowDiag] ${state.id}: 0 trades in 15s window [${state.startTime}, ${state.startTime + 15_000}] — ${JSON.stringify(dbg)}${lagNote}`
-          );
-        }
       } catch (e) {
         logger.warn(`Reaction ${state.id}: failed to capture flow_15s`, { error: e.message });
       }

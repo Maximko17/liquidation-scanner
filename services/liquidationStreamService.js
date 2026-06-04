@@ -27,8 +27,6 @@ class LiquidationStreamService {
     this.pingInterval = null; // Ping/pong keepalive interval
     this._pendingResubscribe = null; // Symbols to re-subscribe after reconnect
     this._serverTimeOffset = 0; // Clock drift correction (ms)
-    this._lastDataAt = 0; // TEMP DIAG: last liquidation frame (ms) — sparse by nature, informational
-    this._lastPongAt = 0; // TEMP DIAG: last Bybit {op:'pong'} (ms)
   }
 
   /**
@@ -138,16 +136,8 @@ class LiquidationStreamService {
       return;
     }
 
-    // TEMP DIAG: Bybit JSON keepalive reply — control-channel liveness.
-    // Bybit v5 replies to {op:'ping'} with {op:'ping', ret_msg:'pong'} — pong is in ret_msg.
-    if (message.ret_msg === 'pong' || message.op === 'pong') {
-      this._lastPongAt = Date.now();
-      return;
-    }
-
     // Liquidation event stream
     if (message.topic && message.topic.startsWith('allLiquidation.')) {
-      this._lastDataAt = Date.now(); // TEMP DIAG: data-channel liveness (sparse)
       const symbol = message.topic.replace('allLiquidation.', '');
       const events = message.data; // Array of liquidation events
 
@@ -419,22 +409,6 @@ class LiquidationStreamService {
       subscribedCount: this.subscribedSymbols.size,
       blacklistedCount: this.blacklist.size,
       reconnectAttempts: this.reconnectAttempts,
-    };
-  }
-
-  /**
-   * TEMP DIAG: liveness snapshot for the stream-stall investigation. Remove after diagnosis.
-   * (dataAge is informational only — liquidation data is sparse by nature.)
-   * @returns {object}
-   */
-  getLiveness() {
-    const now = Date.now();
-    return {
-      connected: this.isConnected,
-      readyState: this.ws ? this.ws.readyState : -1,
-      dataAge: this._lastDataAt ? now - this._lastDataAt : null,
-      pongAge: this._lastPongAt ? now - this._lastPongAt : null,
-      recon: this.reconnectAttempts,
     };
   }
 }
