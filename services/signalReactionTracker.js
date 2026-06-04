@@ -508,17 +508,22 @@ class SignalReactionTracker {
     const cvd_60s = flow_60s.cvd;
 
     // ── De-contaminate aligned CVD → VOLUNTARY flow ─────────
-    // Raw aligned CVD includes (a) the liquidation's own forced fills, which print in
-    // the trade feed in the aligned direction (a one-time lump → subtract L_now once),
-    // and (b) the symbol's normal background flow (a rate → subtract rate × windowSec).
-    // What remains is the voluntary flow reacting to the event. A negative result is
-    // meaningful: it is genuine absorption (real flow trading against the forced move).
+    // The flow window is FORWARD (post-signal: [startTime, startTime+N]). The triggering
+    // liquidation's own forced fills happened in the 3s BEFORE startTime (the L_now detection
+    // window), so they are already OUTSIDE this window — we must NOT subtract L_now. (Doing so
+    // over-subtracted and pinned CVD near −L_now → spurious "absorption against ≈ liquidation
+    // size" on almost every signal.) We only strip the symbol's normal background flow
+    // (baseline rate × windowSec). What remains is voluntary flow reacting to the event; a
+    // negative result is genuine absorption (real flow trading against the forced move).
+    // KNOWN RESIDUAL (TODO — see §11 Option 2): continuation liquidations landing INSIDE the
+    // window still contaminate cvd_N; to remove them, subtract the actual in-window liquidation
+    // USD (not the pre-signal L_now).
     const baselineWindowSec = (config.FLOW_BASELINE_WINDOW_MS || 60_000) / 1000;
     const baselineAlignedPerSec = flowBaseline
       ? (flowBaseline.cvd * favDir) / baselineWindowSec
       : 0;
     const decontam = (rawAligned, windowSec) =>
-      rawAligned - L_now - baselineAlignedPerSec * windowSec;
+      rawAligned - baselineAlignedPerSec * windowSec;
 
     const cvd5_aligned = decontam(cvd_5s * favDir, 5);
     const cvd15_aligned = decontam(cvd_15s * favDir, 15);
