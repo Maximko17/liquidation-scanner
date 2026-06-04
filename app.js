@@ -24,9 +24,10 @@ import tradeStreamService from './services/tradeStreamService.js';
 
 // ── Wire callbacks ──────────────────────────────────────────────
 
-// WebSocket events → tracker
+// WebSocket events → tracker (+ reaction tracker for in-window liquidation de-contamination)
 liquidationStreamService.onMessage((event) => {
   tracker.handleEvent(event);
+  reactionTracker.handleLiquidationEvent(event);
 });
 
 // Tracker alerts → alertService + reactionTracker

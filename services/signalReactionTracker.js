@@ -158,9 +158,10 @@ class SignalReactionTracker {
       adverseExtreme: null,
       timeOfMFE: 0,
       flowBaseline: null,
-      flow_5s: null,
       flow_15s: null,
       flow_60s: null,
+      liqUsd_15s: 0, // v2 de-contam: continuation-liquidation USD inside the 15s/60s windows
+      liqUsd_60s: 0,
       timers: { t5: null, t15: null, t60: null, cleanup: null },
       merged: false,
       mergeCount: 0,
@@ -170,6 +171,28 @@ class SignalReactionTracker {
     logger.info(`Reaction: started tracking ${id} (L=${L_now.toFixed(0)}, ratio=${ratio.toFixed(1)}x)`);
 
     this._initTracking(state);
+  }
+
+  /**
+   * v2 de-contamination: accumulate the USD of continuation liquidations that fire INSIDE each active
+   * signal's reaction window (forward, post-signal). Subtracted from aligned CVD in
+   * `_computeParticipation` so participation reflects voluntary flow, not the cascade's own forced fills.
+   * (Live forward accumulation — the liquidation buffer's 20s retention can't serve a 60s lookback.)
+   * @param {{ symbol: string, side: 'long'|'short', size: number, time: number }} event
+   */
+  handleLiquidationEvent(event) {
+    const { symbol, side, size, time } = event;
+    if (!symbol || !side || !(size > 0)) return;
+
+    const signals = this.activeSignals.get(symbol)?.get(side);
+    if (!signals || signals.length === 0) return;
+
+    for (const state of signals) {
+      const dt = time - state.startTime;
+      if (dt <= 0) continue; // trigger / pre-window fills are already outside the forward window
+      if (dt <= 60_000) state.liqUsd_60s += size;
+      if (dt <= 15_000) state.liqUsd_15s += size;
+    }
   }
 
   async _initTracking(state) {
@@ -249,16 +272,7 @@ class SignalReactionTracker {
     state.price_5s = snap?.price ?? state.price_0;
     state.oi_5s = snap?.openInterest || state.oi_0;
     logger.debug(`Reaction ${state.id}: price_5s=${state.price_5s}, oi_5s=${state.oi_5s}`);
-
-    if (tradeStreamService) {
-      try {
-        state.flow_5s = tradeStreamService.getFlowMetrics(
-          state.symbol, state.startTime, state.startTime + 5_000
-        );
-      } catch (e) {
-        logger.warn(`Reaction ${state.id}: failed to capture flow_5s`, { error: e.message });
-      }
-    }
+    // (5s trade flow removed — only 15s/60s flow is consumed.)
   }
 
   async _capture15s(state) {
@@ -482,13 +496,13 @@ class SignalReactionTracker {
    * @returns {ParticipationResult}
    */
   _computeParticipation(state) {
-    const { flow_5s, flow_15s, flow_60s, flowBaseline, side, L_now } = state;
+    const { flow_15s, flow_60s, flowBaseline, side, L_now, liqUsd_15s, liqUsd_60s } = state;
 
     // No flow data — return empty
     if (!flow_15s || !flow_60s) {
       return {
-        cvd_5s: 0, cvd_15s: 0, cvd_60s: 0,
-        cvd5_aligned: 0, cvd15_aligned: 0, cvd60_aligned: 0,
+        cvd_15s: 0, cvd_60s: 0,
+        cvd15_aligned: 0, cvd60_aligned: 0,
         participationRatio: 0,
         aggressorBuyRatio_baseline: null,
         aggressorBuyRatio_reaction: null,
@@ -503,21 +517,18 @@ class SignalReactionTracker {
 
     const favDir = side === 'short' ? 1 : -1;
 
-    const cvd_5s = flow_5s?.cvd ?? 0;
     const cvd_15s = flow_15s.cvd;
     const cvd_60s = flow_60s.cvd;
 
     // ── De-contaminate aligned CVD → VOLUNTARY flow ─────────
-    // The flow window is FORWARD (post-signal: [startTime, startTime+N]). The triggering
-    // liquidation's own forced fills happened in the 3s BEFORE startTime (the L_now detection
-    // window), so they are already OUTSIDE this window — we must NOT subtract L_now. (Doing so
-    // over-subtracted and pinned CVD near −L_now → spurious "absorption against ≈ liquidation
-    // size" on almost every signal.) We only strip the symbol's normal background flow
-    // (baseline rate × windowSec). What remains is voluntary flow reacting to the event; a
-    // negative result is genuine absorption (real flow trading against the forced move).
-    // KNOWN RESIDUAL (TODO — see §11 Option 2): continuation liquidations landing INSIDE the
-    // window still contaminate cvd_N; to remove them, subtract the actual in-window liquidation
-    // USD (not the pre-signal L_now).
+    // The flow window is FORWARD (post-signal: [startTime, startTime+N]). The TRIGGER liquidation's
+    // own forced fills happened in the 3s BEFORE startTime (the L_now detection window), so they are
+    // already OUTSIDE this window — we do NOT subtract L_now (doing so over-subtracted and pinned CVD
+    // near −L_now → spurious "absorption against ≈ liquidation size" on almost every signal).
+    // We strip two contaminants that ARE inside the forward window:
+    //   (a) the symbol's normal background flow — a rate → subtract baselineRate × windowSec;
+    //   (b) CONTINUATION liquidations that fired inside the window — `liqUsd_N`, accumulated live in
+    //       handleLiquidationEvent (v2). What remains is voluntary flow; negative = genuine absorption.
     const baselineWindowSec = (config.FLOW_BASELINE_WINDOW_MS || 60_000) / 1000;
     const baselineAlignedPerSec = flowBaseline
       ? (flowBaseline.cvd * favDir) / baselineWindowSec
@@ -525,9 +536,8 @@ class SignalReactionTracker {
     const decontam = (rawAligned, windowSec) =>
       rawAligned - baselineAlignedPerSec * windowSec;
 
-    const cvd5_aligned = decontam(cvd_5s * favDir, 5);
-    const cvd15_aligned = decontam(cvd_15s * favDir, 15);
-    const cvd60_aligned = decontam(cvd_60s * favDir, 60);
+    const cvd15_aligned = decontam(cvd_15s * favDir, 15) - liqUsd_15s;
+    const cvd60_aligned = decontam(cvd_60s * favDir, 60) - liqUsd_60s;
 
     // Voluntary aligned flow (15s) relative to the liquidation size.
     // Uses 15s to match the displayed CVD and the label logic (was 5s — §11 mismatch).
@@ -560,8 +570,8 @@ class SignalReactionTracker {
     });
 
     return {
-      cvd_5s, cvd_15s, cvd_60s,
-      cvd5_aligned, cvd15_aligned, cvd60_aligned,
+      cvd_15s, cvd_60s,
+      cvd15_aligned, cvd60_aligned,
       participationRatio,
       aggressorBuyRatio_baseline: baselineAggBuy,
       aggressorBuyRatio_reaction: reactionAggBuy,
@@ -842,9 +852,10 @@ class SignalReactionTracker {
  * @property {number|null} adverseExtreme
  * @property {number} timeOfMFE
  * @property {import('./tradeStreamService.js').FlowMetrics|null} flowBaseline
- * @property {import('./tradeStreamService.js').FlowMetrics|null} flow_5s
  * @property {import('./tradeStreamService.js').FlowMetrics|null} flow_15s
  * @property {import('./tradeStreamService.js').FlowMetrics|null} flow_60s
+ * @property {number} liqUsd_15s - USD of continuation liquidations inside +15s (v2 de-contam)
+ * @property {number} liqUsd_60s - USD of continuation liquidations inside +60s (v2 de-contam)
  * @property {{ t5: NodeJS.Timeout|null, t15: NodeJS.Timeout|null, t60: NodeJS.Timeout|null, cleanup: NodeJS.Timeout|null }} timers
  * @property {boolean} merged
  * @property {number} mergeCount
@@ -870,12 +881,10 @@ class SignalReactionTracker {
 
 /**
  * @typedef {object} ParticipationResult
- * @property {number} cvd_5s
  * @property {number} cvd_15s
  * @property {number} cvd_60s
- * @property {number} cvd5_aligned - de-contaminated (voluntary): raw aligned − L_now − baseline
- * @property {number} cvd15_aligned - de-contaminated (voluntary); negative = absorption against
- * @property {number} cvd60_aligned - de-contaminated (voluntary)
+ * @property {number} cvd15_aligned - de-contaminated voluntary: raw aligned − baseline − in-window liq USD; negative = absorption against
+ * @property {number} cvd60_aligned - de-contaminated voluntary: raw aligned − baseline − in-window liq USD
  * @property {number} participationRatio - cvd15_aligned / L_now (voluntary 15s flow vs liq size)
  * @property {number|null} aggressorBuyRatio_baseline
  * @property {number|null} aggressorBuyRatio_reaction
