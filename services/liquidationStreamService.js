@@ -139,7 +139,8 @@ class LiquidationStreamService {
     }
 
     // TEMP DIAG: Bybit JSON keepalive reply — control-channel liveness.
-    if (message.op === 'pong') {
+    // Bybit v5 replies to {op:'ping'} with {op:'ping', ret_msg:'pong'} — pong is in ret_msg.
+    if (message.ret_msg === 'pong' || message.op === 'pong') {
       this._lastPongAt = Date.now();
       return;
     }
