@@ -1,3 +1,4 @@
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import logger from './utils/logger.js';
 import config from './config/index.js';
 import symbolService from './services/symbolService.js';
@@ -119,6 +120,25 @@ async function start() {
   logger.info(`   Symbol refresh: every ${config.FETCH_INTERVAL_MS / 60000}min`);
   logger.info(`   Alert channels: ${[config.TELEGRAM_BOT_TOKEN && 'Telegram', config.PUSHOVER_USER_KEY && 'Pushover'].filter(Boolean).join(', ') || 'NONE CONFIGURED'}`);
   logger.info(`   CVD analysis: ${tradeStreamService.isConnected ? 'enabled' : 'disabled'}`);
+
+  // TEMP DIAG: stream-liveness heartbeat to localize the recurring trade-WS stall (option D).
+  // Off unless STREAM_HEARTBEAT_MS > 0. One line: trade/price/liq data+pong age + event-loop lag.
+  // dataAge/pongAge in ms ('-' = none yet); readyState: 0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED.
+  if (config.STREAM_HEARTBEAT_MS > 0) {
+    const eld = monitorEventLoopDelay({ resolution: 20 });
+    eld.enable();
+    const fmt = (l) => `conn=${l.connected ? 1 : 0} rs=${l.readyState} data=${l.dataAge ?? '-'} pong=${l.pongAge ?? '-'} recon=${l.recon}`;
+    setInterval(() => {
+      const t = tradeStreamService.getLiveness();
+      const p = priceStreamService.getLiveness();
+      const q = liquidationStreamService.getLiveness();
+      const lagMax = Number.isFinite(eld.max) ? Math.round(eld.max / 1e6) : 0;
+      const lagMean = Number.isFinite(eld.mean) ? Math.round(eld.mean / 1e6) : 0;
+      eld.reset();
+      logger.info(`[heartbeat] trade[${fmt(t)}] price[${fmt(p)}] liq[${fmt(q)}] loopLag{max=${lagMax} mean=${lagMean}}ms`);
+    }, config.STREAM_HEARTBEAT_MS);
+    logger.info(`[heartbeat] enabled every ${config.STREAM_HEARTBEAT_MS}ms`);
+  }
 }
 
 // ── Shutdown ────────────────────────────────────────────────────

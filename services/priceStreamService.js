@@ -41,6 +41,9 @@ class PriceStreamService {
     /** @type {Array<(symbol: string, price: number) => void>} */
     this.priceCallbacks = [];
 
+    this._lastDataAt = 0; // TEMP DIAG: last ticker frame (ms)
+    this._lastPongAt = 0; // TEMP DIAG: last Bybit {op:'pong'} (ms)
+
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 20;
     this.maxReconnectDelay = 30_000;
@@ -250,8 +253,15 @@ class PriceStreamService {
       return;
     }
 
+    // TEMP DIAG: Bybit JSON keepalive reply — control-channel liveness.
+    if (message.op === 'pong') {
+      this._lastPongAt = Date.now();
+      return;
+    }
+
     // Ticker data stream
     if (message.topic && message.topic.startsWith('tickers.')) {
+      this._lastDataAt = Date.now(); // TEMP DIAG: data-channel liveness
       const symbol = message.topic.replace('tickers.', '');
       const tickerData = message.data;
 
@@ -520,6 +530,21 @@ class PriceStreamService {
    */
   onPriceUpdate(callback) {
     this.priceCallbacks.push(callback);
+  }
+
+  /**
+   * TEMP DIAG: liveness snapshot for the stream-stall investigation. Remove after diagnosis.
+   * @returns {object}
+   */
+  getLiveness() {
+    const now = Date.now();
+    return {
+      connected: this.isConnected,
+      readyState: this.ws ? this.ws.readyState : -1,
+      dataAge: this._lastDataAt ? now - this._lastDataAt : null,
+      pongAge: this._lastPongAt ? now - this._lastPongAt : null,
+      recon: this.reconnectAttempts,
+    };
   }
 
   /**

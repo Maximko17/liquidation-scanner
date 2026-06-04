@@ -47,6 +47,7 @@ class TradeStreamService {
     this.pingInterval = null;
     this.watchdogInterval = null;
     this._lastDataAt = 0; // ms timestamp of the last received trade frame (any symbol); 0 = none yet
+    this._lastPongAt = 0; // TEMP DIAG: last Bybit {op:'pong'} (ms)
     this._pendingResubscribe = null;
     this._serverTimeOffset = 0; // Clock drift correction (ms), aligns exchange T to local clock
 
@@ -264,6 +265,12 @@ class TradeStreamService {
   _handleMessage(message) {
     if (message.op === 'subscribe') {
       this._handleSubscribeResponse(message);
+      return;
+    }
+
+    // TEMP DIAG: Bybit JSON keepalive reply — control-channel liveness.
+    if (message.op === 'pong') {
+      this._lastPongAt = Date.now();
       return;
     }
 
@@ -549,6 +556,21 @@ class TradeStreamService {
       lastTime: bufferLen > 0 ? buffer[bufferLen - 1].time : null,
       streamLastTime,
       streamLastAgeMs: streamLastTime !== null ? Date.now() - streamLastTime : null,
+    };
+  }
+
+  /**
+   * TEMP DIAG: liveness snapshot for the stream-stall investigation. Remove after diagnosis.
+   * @returns {object}
+   */
+  getLiveness() {
+    const now = Date.now();
+    return {
+      connected: this.isConnected,
+      readyState: this.ws ? this.ws.readyState : -1,
+      dataAge: this._lastDataAt ? now - this._lastDataAt : null,
+      pongAge: this._lastPongAt ? now - this._lastPongAt : null,
+      recon: this.reconnectAttempts,
     };
   }
 

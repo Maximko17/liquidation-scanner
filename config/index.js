@@ -90,6 +90,11 @@ export default {
   PUSHOVER_USER_KEY: process.env.PUSHOVER_USER_KEY || '',
   PUSHOVER_APP_TOKEN: process.env.PUSHOVER_APP_TOKEN || '',
 
+  // ── Diagnostics (temporary) ───────────────────────
+  // Stream-liveness heartbeat interval (ms); 0 = off. Logs trade/price/liq data+pong age
+  // and event-loop lag to localize the recurring trade-WS stall.
+  STREAM_HEARTBEAT_MS: parseInt(process.env.STREAM_HEARTBEAT_MS, 10) || 0,
+
   // ── Logging ───────────────────────────────────────
   LOG_LEVEL: process.env.LOG_LEVEL || 'info',
 
